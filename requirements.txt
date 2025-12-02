@@ -11,3 +11,13 @@ numpy>=1.24
 
 # Werkzeug for secure file handling (comes with Flask but explicit for clarity)
 werkzeug
+
+# Production WSGI server
+gunicorn
+
+# For health check endpoint
+requests
+
+# Security and production features
+Flask-Limiter>=3.5.0
+Flask-CORS>=4.0.0
