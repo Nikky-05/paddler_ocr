@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git
+.env
+uploads/
+*.jpg
+*.png
+*.jpeg
+*.webp
+reproduce_*.py
+debug_*.jpg
+ocr_results.json
+reproduction_results.json
+PaddleOcr.py.*

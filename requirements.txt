@@ -1,0 +1,13 @@
+# Flask web framework
+Flask
+
+# PaddleOCR for document text extraction
+paddlepaddle==3.2.2
+paddleocr==3.3.2
+
+# Image processing
+Pillow>=9.0.0
+numpy>=1.24
+
+# Werkzeug for secure file handling (comes with Flask but explicit for clarity)
+werkzeug
