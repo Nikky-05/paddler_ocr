@@ -70,18 +70,16 @@ def get_ocr():
     # initialize OCR with optimized settings
     try:
         # use_angle_cls=True enables orientation classification (standard)
-        # show_log=False reduces I/O
         # enable_mkldnn=False to avoid 'cat: not found' errors on minimal Linux
         OCR = PaddleOCR(
             use_angle_cls=True, 
             lang='en', 
             enable_mkldnn=False,
-            use_mp=False,  # Disable multiprocessing to avoid shared memory issues
-            show_log=True  # Keep logs for debugging
+            use_mp=False  # Disable multiprocessing to avoid shared memory issues
         )
     except TypeError:
-        # fallback for older versions
-        OCR = PaddleOCR(lang='en', show_log=True)
+        # fallback for older versions - absolute minimum
+        OCR = PaddleOCR(lang='en')
     return OCR
 from PIL import Image
 import numpy as np
