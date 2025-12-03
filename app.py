@@ -162,6 +162,54 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
 
 
+def validate_file_size(file):
+    """Validate file size before processing"""
+    # Get file size by seeking to end
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)  # Reset to beginning
+    
+    max_size = Config.MAX_CONTENT_LENGTH
+    if file_size > max_size:
+        size_mb = file_size / (1024 * 1024)
+        limit_mb = max_size / (1024 * 1024)
+        raise ValueError(f"File size ({size_mb:.2f}MB) exceeds the maximum limit of {limit_mb}MB")
+    
+    return True
+
+
+def validate_image_dimensions(filepath):
+    """Validate image dimensions for optimal OCR processing"""
+    try:
+        from PIL import Image
+        
+        with Image.open(filepath) as img:
+            width, height = img.size
+            max_dimension = 4096  # Maximum dimension for processing
+            
+            if width > max_dimension or height > max_dimension:
+                raise ValueError(
+                    f"Image dimensions ({width}x{height}) exceed maximum allowed size of {max_dimension}x{max_dimension} pixels. "
+                    f"Please resize your image before uploading."
+                )
+            
+            # Minimum dimension check for quality
+            min_dimension = 100
+            if width < min_dimension or height < min_dimension:
+                raise ValueError(
+                    f"Image dimensions ({width}x{height}) are too small. "
+                    f"Minimum size is {min_dimension}x{min_dimension} pixels for accurate OCR."
+                )
+            
+            logger.info(f"Image dimensions validated: {width}x{height}")
+            return True
+    except Exception as e:
+        if "exceed maximum" in str(e) or "too small" in str(e):
+            raise
+        logger.error(f"Error validating image: {str(e)}")
+        raise ValueError(f"Invalid or corrupted image file: {str(e)}")
+
+
 # Public Routes (No authentication required)
 @app.route('/')
 def index():
@@ -191,6 +239,8 @@ def api_info():
         'supported_documents': Config.SUPPORTED_DOCUMENTS,
         'supported_formats': list(Config.ALLOWED_EXTENSIONS),
         'max_file_size': '16MB',
+        'max_image_dimensions': '4096x4096 pixels',
+        'min_image_dimensions': '100x100 pixels',
         'endpoints': {
             'web_interface': '/',
             'health': '/health',
@@ -249,6 +299,13 @@ def upload_file():
         logger.warning(f"Invalid file type: {file.filename}")
         return jsonify({'error': f'Invalid file type. Allowed: {", ".join(Config.ALLOWED_EXTENSIONS).upper()}'}), 400
     
+    # Validate file size
+    try:
+        validate_file_size(file)
+    except ValueError as e:
+        logger.warning(f"File size validation failed: {str(e)}")
+        return jsonify({'error': str(e)}), 413
+    
     filepath = None
     try:
         # Save the uploaded file
@@ -256,6 +313,13 @@ def upload_file():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{request.id}_{filename}")
         logger.info(f"Saving file to: {filepath}")
         file.save(filepath)
+        
+        # Validate image dimensions
+        try:
+            validate_image_dimensions(filepath)
+        except ValueError as e:
+            logger.warning(f"Image validation failed: {str(e)}")
+            return jsonify({'error': str(e)}), 400
         
         # Process the image with OCR
         logger.info(f"Processing OCR for: {filename}")
@@ -332,6 +396,16 @@ def upload_file_v1():
             'request_id': request.id
         }), 400
     
+    # Validate file size
+    try:
+        validate_file_size(file)
+    except ValueError as e:
+        logger.warning(f"File size validation failed: {str(e)}")
+        return jsonify({
+            'error': str(e),
+            'request_id': request.id
+        }), 413
+    
     filepath = None
     try:
         # Save the uploaded file
@@ -339,6 +413,16 @@ def upload_file_v1():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{request.id}_{filename}")
         logger.info(f"Saving file to: {filepath}")
         file.save(filepath)
+        
+        # Validate image dimensions
+        try:
+            validate_image_dimensions(filepath)
+        except ValueError as e:
+            logger.warning(f"Image validation failed: {str(e)}")
+            return jsonify({
+                'error': str(e),
+                'request_id': request.id
+            }), 400
         
         # Process the image with OCR
         logger.info(f"Processing OCR for: {filename}")
