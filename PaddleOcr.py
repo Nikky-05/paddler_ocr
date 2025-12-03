@@ -71,11 +71,19 @@ def get_ocr():
     try:
         # use_angle_cls=True enables orientation classification (standard)
         # show_log=False reduces I/O
-        # enable_mkldnn=True accelerates CPU inference
-        OCR = PaddleOCR(use_angle_cls=True, lang='en')
+        # enable_mkldnn=False to avoid 'cat: not found' errors on minimal Linux
+        # use_gpu=False for CPU-only instances
+        OCR = PaddleOCR(
+            use_angle_cls=True, 
+            lang='en', 
+            use_gpu=False, 
+            enable_mkldnn=False,
+            use_mp=False,  # Disable multiprocessing to avoid shared memory issues
+            show_log=True  # Keep logs for debugging
+        )
     except TypeError:
         # fallback for older versions
-        OCR = PaddleOCR(lang='en', show_log=False)
+        OCR = PaddleOCR(lang='en', use_gpu=False, show_log=True)
     return OCR
 from PIL import Image
 import numpy as np
@@ -99,11 +107,15 @@ def ocr_image(path: str) -> List[str]:
     def run_ocr_on(arg):
         try:
             res = ocr.ocr(arg)
-        except Exception:
+        except Exception as e:
+            if os.environ.get('OCR_DEBUG'):
+                print(f"DEBUG: OCR failed: {e}")
             # fallback to predict if ocr() signature changed
             try:
                 res = ocr.predict(arg)
-            except Exception:
+            except Exception as e2:
+                if os.environ.get('OCR_DEBUG'):
+                    print(f"DEBUG: Fallback predict failed: {e2}")
                 return []
         return res
 
@@ -188,12 +200,29 @@ def ocr_records(path: str) -> List[Dict]:
     def run_ocr_on(arg):
         try:
             res = ocr.ocr(arg)
-        except Exception:
+        except Exception as e:
+            if os.environ.get('OCR_DEBUG'):
+                print(f"DEBUG: OCR records failed: {e}")
             try:
                 res = ocr.predict(arg)
-            except Exception:
+            except Exception as e2:
+                if os.environ.get('OCR_DEBUG'):
+                    print(f"DEBUG: Fallback predict records failed: {e2}")
                 return []
         return res
+
+    def is_english_text(text):
+        """Check if text contains only English characters (Latin script, numbers, punctuation).
+        Filters out Marathi/Devanagari and other non-English scripts."""
+        if not text:
+            return False
+        # Remove common punctuation and whitespace
+        cleaned = re.sub(r'[\s\.,\-\/:;()\[\]{}!?@#$%^&*+=_~`\'"<>|\\]', '', text)
+        if not cleaned:
+            return True  # Allow pure punctuation/whitespace
+        # Check if remaining characters are Latin alphabet (A-Z, a-z) or digits
+        # This will filter out Devanagari (0900-097F), Arabic, Chinese, etc.
+        return bool(re.match(r'^[A-Za-z0-9]+$', cleaned))
 
     def parse_result(res):
         recs = []
@@ -205,6 +234,9 @@ def ocr_records(path: str) -> List[Dict]:
             for idx, txt in enumerate(texts):
                 try:
                     if not txt or not str(txt).strip():
+                        continue
+                    # Filter out non-English text (Marathi/Devanagari, etc.)
+                    if not is_english_text(str(txt)):
                         continue
                     conf = float(scores[idx]) if idx < len(scores) else 0.0
                     poly = polys[idx] if idx < len(polys) else None
@@ -229,6 +261,9 @@ def ocr_records(path: str) -> List[Dict]:
                         text = str(recog)
                         conf = 0.0
                     if not text or not text.strip():
+                        continue
+                    # Filter out non-English text (Marathi/Devanagari, etc.)
+                    if not is_english_text(text):
                         continue
                     y = min([p[1] for p in box])
                     recs.append({"text": text.strip(), "conf": conf, "y": y})
@@ -768,9 +803,9 @@ def extract_voter(lines: List[str], text: str) -> Dict:
                     obj['father_name'] = val
                 break
     
-    # 4. DOB - Look for "Date of Birth" or date pattern
+    # 4. DOB - Look for "Date of Birth" or date pattern (English only)
     for i, ln in enumerate(lines):
-        if re.search(r'Date\s*of\s*Birth|DOB|जन्म\s*तारीख', ln, re.I):
+        if re.search(r'Date\s*of\s*Birth|DOB', ln, re.I):
             # Extract date from same line
             m = re.search(r'(\d{2}[\-\/]\d{2}[\-\/]\d{4})', ln)
             if m:
@@ -789,34 +824,34 @@ def extract_voter(lines: List[str], text: str) -> Dict:
         if m:
             obj['dob'] = m.group(1)
     
-    # 5. Gender - Look for "Sex" or "Gender" or direct MALE/FEMALE
+    # 5. Gender - Look for "Sex" or "Gender" or direct MALE/FEMALE (English only)
     for i, ln in enumerate(lines):
-        if re.search(r'Sex|Gender|लिंग', ln, re.I):
+        if re.search(r'Sex|Gender', ln, re.I):
             # Check same line
-            if re.search(r'MALE|FEMALE|पुरुष|महिला', ln, re.I):
-                m = re.search(r'(MALE|FEMALE|पुरुष|महिला)', ln, re.I)
+            if re.search(r'MALE|FEMALE', ln, re.I):
+                m = re.search(r'(MALE|FEMALE)', ln, re.I)
                 if m:
                     gender_val = m.group(1).upper()
-                    if gender_val in ['MALE', 'पुरुष']:
+                    if gender_val == 'MALE':
                         obj['gender'] = 'Male'
-                    elif gender_val in ['FEMALE', 'महिला']:
+                    elif gender_val == 'FEMALE':
                         obj['gender'] = 'Female'
             else:
                 # Check next line
                 val = nearest_line(lines, i, 1)
-                if re.search(r'MALE|FEMALE|पुरुष|महिला', val, re.I):
-                    m = re.search(r'(MALE|FEMALE|पुरुष|महिला)', val, re.I)
+                if re.search(r'MALE|FEMALE', val, re.I):
+                    m = re.search(r'(MALE|FEMALE)', val, re.I)
                     if m:
                         gender_val = m.group(1).upper()
-                        if gender_val in ['MALE', 'पुरुष']:
+                        if gender_val == 'MALE':
                             obj['gender'] = 'Male'
-                        elif gender_val in ['FEMALE', 'महिला']:
+                        elif gender_val == 'FEMALE':
                             obj['gender'] = 'Female'
             break
     
-    # 6. Address - Look for "Address" label
+    # 6. Address - Look for "Address" label (English only)
     for i, ln in enumerate(lines):
-        if re.search(r'Address|पत्ता', ln, re.I):
+        if re.search(r'Address', ln, re.I):
             addr = []
             for j in range(i + 1, min(len(lines), i + 8)):
                 next_ln = lines[j].strip()
