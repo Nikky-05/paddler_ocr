@@ -74,8 +74,7 @@ def get_ocr():
         OCR = PaddleOCR(
             use_angle_cls=True, 
             lang='en', 
-            enable_mkldnn=False,
-            use_mp=False  # Disable multiprocessing to avoid shared memory issues
+            enable_mkldnn=False
         )
     except TypeError:
         # fallback for older versions - absolute minimum
