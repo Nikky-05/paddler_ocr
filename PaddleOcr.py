@@ -72,18 +72,16 @@ def get_ocr():
         # use_angle_cls=True enables orientation classification (standard)
         # show_log=False reduces I/O
         # enable_mkldnn=False to avoid 'cat: not found' errors on minimal Linux
-        # use_gpu=False for CPU-only instances
         OCR = PaddleOCR(
             use_angle_cls=True, 
             lang='en', 
-            use_gpu=False, 
             enable_mkldnn=False,
             use_mp=False,  # Disable multiprocessing to avoid shared memory issues
             show_log=True  # Keep logs for debugging
         )
     except TypeError:
         # fallback for older versions
-        OCR = PaddleOCR(lang='en', use_gpu=False, show_log=True)
+        OCR = PaddleOCR(lang='en', show_log=True)
     return OCR
 from PIL import Image
 import numpy as np
