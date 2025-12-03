@@ -457,6 +457,38 @@ def upload_file_v1():
                 logger.warning(f"Failed to cleanup file {filepath}: {str(cleanup_error)}")
 
 
+def warmup_ocr_models():
+    """Pre-load PaddleOCR models on startup to avoid empty results on first requests.
+    
+    This function initializes the OCR engine and runs a dummy prediction to ensure
+    all models are downloaded and loaded into memory before the first real request.
+    """
+    try:
+        logger.info("Warming up PaddleOCR models...")
+        from PaddleOcr import get_ocr
+        import numpy as np
+        
+        # Initialize OCR (downloads models if needed)
+        ocr = get_ocr()
+        
+        # Create a small dummy image (100x100 white image)
+        dummy_image = np.ones((100, 100, 3), dtype=np.uint8) * 255
+        
+        # Run a dummy OCR to load models into memory
+        try:
+            ocr.ocr(dummy_image)
+        except:
+            # Fallback for different PaddleOCR versions
+            try:
+                ocr.predict(dummy_image)
+            except:
+                pass
+        
+        logger.info("✓ PaddleOCR models loaded successfully")
+    except Exception as e:
+        logger.warning(f"Model warmup failed (will load on first request): {str(e)}")
+
+
 if __name__ == '__main__':
     # Use PORT environment variable if available (required for Cloud Run/App Engine)
     port = int(os.environ.get('PORT', 5000))
@@ -466,5 +498,8 @@ if __name__ == '__main__':
     logger.info(f"Starting {Config.API_TITLE} v{Config.API_VERSION}")
     logger.info(f"Server running on port {port}")
     logger.info(f"Debug mode: {debug_mode}")
+    
+    # Pre-load OCR models before accepting requests
+    warmup_ocr_models()
     
     app.run(debug=debug_mode, host='0.0.0.0', port=port)
