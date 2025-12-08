@@ -45,6 +45,12 @@ logger.info(f"Rate limiting: {'enabled' if Config.RATE_LIMIT_ENABLED else 'disab
 CORS(app, origins=Config.get_allowed_origins())
 logger.info(f"CORS configured for origins: {Config.get_allowed_origins()}")
 
+# Ensure PaddleOCR can write to home directory in serverless env
+if os.environ.get('GCP_PROJECT') or os.environ.get('GAE_APPLICATION'):
+    os.environ['HOME'] = '/tmp'
+    os.environ['OCR_DEBUG'] = '1'  # Enable debug logging
+
+
 # Initialize Rate Limiter
 limiter = Limiter(
     app=app,
@@ -178,9 +184,53 @@ def validate_file_size(file):
     return True
 
 
-def validate_image_dimensions(filepath):
-    """Validate image dimensions for optimal OCR processing"""
+def convert_pdf_to_images(pdf_path):
+    """Convert PDF file to images (one per page)
+    Returns a list of image file paths
+    """
     try:
+        from pdf2image import convert_from_path
+        import tempfile
+        
+        logger.info(f"Converting PDF to images: {pdf_path}")
+        
+        # Convert PDF to images (one per page)
+        # Use lower DPI for faster processing, but high enough for OCR
+        images = convert_from_path(pdf_path, dpi=200)
+        
+        image_paths = []
+        temp_dir = tempfile.gettempdir()
+        
+        for i, image in enumerate(images):
+            # Save each page as a temporary image
+            img_path = os.path.join(temp_dir, f"{os.path.basename(pdf_path)}_page_{i+1}.png")
+            image.save(img_path, 'PNG')
+            image_paths.append(img_path)
+            logger.info(f"Saved PDF page {i+1} to: {img_path}")
+        
+        logger.info(f"Converted PDF to {len(image_paths)} image(s)")
+        return image_paths
+    
+    except ImportError:
+        raise ValueError(
+            "PDF processing requires 'pdf2image' and 'poppler' to be installed. "
+            "Please install: pip install pdf2image"
+        )
+    except Exception as e:
+        logger.error(f"Error converting PDF: {str(e)}")
+        raise ValueError(f"Failed to process PDF file: {str(e)}")
+
+
+def validate_image_dimensions(filepath):
+    """Validate image dimensions for optimal OCR processing
+    Also handles PDF files by skipping dimension validation
+    """
+    try:
+        # Skip validation for PDF files (will be converted to images later)
+        if filepath.lower().endswith('.pdf'):
+            logger.info("PDF file detected, skipping dimension validation")
+            return True
+        
         from PIL import Image
         
         with Image.open(filepath) as img:
@@ -307,6 +357,8 @@ def upload_file():
         return jsonify({'error': str(e)}), 413
     
     filepath = None
+    pdf_image_paths = []
+    
     try:
         # Save the uploaded file
         filename = secure_filename(file.filename)
@@ -321,7 +373,40 @@ def upload_file():
             logger.warning(f"Image validation failed: {str(e)}")
             return jsonify({'error': str(e)}), 400
         
-        # Process the image with OCR
+        # Handle PDF files
+        if filepath.lower().endswith('.pdf'):
+            logger.info("PDF file detected, converting to images")
+            try:
+                pdf_image_paths = convert_pdf_to_images(filepath)
+                
+                # Process all pages
+                all_results = []
+                for i, img_path in enumerate(pdf_image_paths):
+                    logger.info(f"Processing PDF page {i+1}/{len(pdf_image_paths)}")
+                    result = process_path(Path(img_path))
+                    result['page_number'] = i + 1
+                    all_results.append(result)
+                
+                # If single page, return just that result
+                if len(all_results) == 1:
+                    result = all_results[0]
+                    result['request_id'] = request.id
+                    result['source_file'] = filename
+                    return jsonify(result)
+                
+                # For multi-page PDFs, return all results
+                return jsonify({
+                    'request_id': request.id,
+                    'source_file': filename,
+                    'total_pages': len(all_results),
+                    'pages': all_results
+                })
+            
+            except ValueError as e:
+                logger.error(f"PDF processing failed: {str(e)}")
+                return jsonify({'error': str(e)}), 400
+        
+        # Process regular image files
         logger.info(f"Processing OCR for: {filename}")
         result = process_path(Path(filepath))
         logger.info(f"OCR completed successfully for: {filename}")
@@ -341,13 +426,22 @@ def upload_file():
         }), 500
     
     finally:
-        # Clean up - delete the uploaded file after processing
+        # Clean up - delete the uploaded file and any PDF-generated images
         if filepath and os.path.exists(filepath):
             try:
                 os.remove(filepath)
                 logger.info(f"Cleaned up temporary file: {filepath}")
             except Exception as cleanup_error:
                 logger.warning(f"Failed to cleanup file {filepath}: {str(cleanup_error)}")
+        
+        # Clean up PDF-generated images
+        for img_path in pdf_image_paths:
+            if os.path.exists(img_path):
+                try:
+                    os.remove(img_path)
+                    logger.info(f"Cleaned up PDF image: {img_path}")
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup PDF image {img_path}: {str(cleanup_error)}")
 
 
 # API v1 Routes (Require authentication)
@@ -407,6 +501,8 @@ def upload_file_v1():
         }), 413
     
     filepath = None
+    pdf_image_paths = []
+    
     try:
         # Save the uploaded file
         filename = secure_filename(file.filename)
@@ -424,7 +520,51 @@ def upload_file_v1():
                 'request_id': request.id
             }), 400
         
-        # Process the image with OCR
+        # Handle PDF files
+        if filepath.lower().endswith('.pdf'):
+            logger.info("PDF file detected, converting to images")
+            try:
+                pdf_image_paths = convert_pdf_to_images(filepath)
+                
+                # Process all pages
+                all_results = []
+                for i, img_path in enumerate(pdf_image_paths):
+                    logger.info(f"Processing PDF page {i+1}/{len(pdf_image_paths)}")
+                    page_start_time = datetime.now()
+                    result = process_path(Path(img_path))
+                    page_processing_time = (datetime.now() - page_start_time).total_seconds()
+                    result['page_number'] = i + 1
+                    result['processing_time_seconds'] = round(page_processing_time, 2)
+                    all_results.append(result)
+                
+                total_processing_time = sum(r['processing_time_seconds'] for r in all_results)
+                
+                # If single page, return just that result
+                if len(all_results) == 1:
+                    result = all_results[0]
+                    result['request_id'] = request.id
+                    result['source_file'] = filename
+                    result['api_version'] = 'v1'
+                    return jsonify(result)
+                
+                # For multi-page PDFs, return all results
+                return jsonify({
+                    'request_id': request.id,
+                    'source_file': filename,
+                    'total_pages': len(all_results),
+                    'processing_time_seconds': round(total_processing_time, 2),
+                    'api_version': 'v1',
+                    'pages': all_results
+                })
+            
+            except ValueError as e:
+                logger.error(f"PDF processing failed: {str(e)}")
+                return jsonify({
+                    'error': str(e),
+                    'request_id': request.id
+                }), 400
+        
+        # Process regular image files
         logger.info(f"Processing OCR for: {filename}")
         start_time = datetime.now()
         result = process_path(Path(filepath))
@@ -448,13 +588,22 @@ def upload_file_v1():
         }), 500
     
     finally:
-        # Clean up - delete the uploaded file after processing
+        # Clean up - delete the uploaded file and any PDF-generated images
         if filepath and os.path.exists(filepath):
             try:
                 os.remove(filepath)
                 logger.info(f"Cleaned up temporary file: {filepath}")
             except Exception as cleanup_error:
                 logger.warning(f"Failed to cleanup file {filepath}: {str(cleanup_error)}")
+        
+        # Clean up PDF-generated images
+        for img_path in pdf_image_paths:
+            if os.path.exists(img_path):
+                try:
+                    os.remove(img_path)
+                    logger.info(f"Cleaned up PDF image: {img_path}")
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup PDF image {img_path}: {str(cleanup_error)}")
 
 
 def warmup_ocr_models():
@@ -488,6 +637,9 @@ def warmup_ocr_models():
     except Exception as e:
         logger.warning(f"Model warmup failed (will load on first request): {str(e)}")
 
+# Run warmup on module import (so it runs in Gunicorn)
+warmup_ocr_models()
+
 
 if __name__ == '__main__':
     # Use PORT environment variable if available (required for Cloud Run/App Engine)
@@ -498,8 +650,5 @@ if __name__ == '__main__':
     logger.info(f"Starting {Config.API_TITLE} v{Config.API_VERSION}")
     logger.info(f"Server running on port {port}")
     logger.info(f"Debug mode: {debug_mode}")
-    
-    # Pre-load OCR models before accepting requests
-    warmup_ocr_models()
     
     app.run(debug=debug_mode, host='0.0.0.0', port=port)

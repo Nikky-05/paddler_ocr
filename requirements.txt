@@ -4,10 +4,14 @@ Flask
 # PaddleOCR for document text extraction
 paddlepaddle==3.2.2
 paddleocr==3.3.2
+opencv-python-headless>=4.6.0.66
 
 # Image processing
 Pillow>=9.0.0
 numpy>=1.24
+
+# PDF processing
+pdf2image>=1.16.0
 
 # Werkzeug for secure file handling (comes with Flask but explicit for clarity)
 werkzeug

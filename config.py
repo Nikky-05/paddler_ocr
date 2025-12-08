@@ -27,7 +27,7 @@ class Config:
     UPLOAD_RATE_LIMIT = os.environ.get('UPLOAD_RATE_LIMIT', '10 per minute')
     
     # File Upload Configuration
-    ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff'}
+    ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'jfif', 'pdf'}
     
     # API Metadata
     API_VERSION = '1.0.0'

@@ -379,19 +379,33 @@ def text_blob(lines: List[str]) -> str:
 def detect_doc_type(text: str) -> str:
     """Heuristic doc type detection."""
     t = text.upper()
-    # Passport
+    
+    # Passport - Check for MRZ pattern first (most reliable)
+    if '<<' in text or 'P<IND' in text:
+        return 'passport'
+    
+    # Passport - Check for common passport keywords
+    if 'REPUBLIC OF INDIA' in t and ('SURNAME' in t or 'GIVEN NAME' in t):
+        return 'passport'
+    
+    # Passport - Check for passport number pattern with "PASSPORT" keyword
     if re.search(r'\bP(?!AN)[A-Z0-9]{7}\b', text) and 'PASSPORT' in t:
         return 'passport'
+    
+    # Passport - General passport keyword or number pattern
     if 'PASSPORT' in t or re.search(r'\b[P][0-9]{7}\b', t):
         return 'passport'
+    
     # PAN
     if re.search(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b', text):
         return 'pan'
     if 'INCOME TAX' in t and 'PERMANENT ACCOUNT' in t or 'INCOME' in t and 'PAN' in t:
         return 'pan'
+    
     # Aadhaar
     if re.search(r'\b\d{4}\s?\d{4}\s?\d{4}\b', text) or 'AADHAAR' in t or 'AADHAR' in t:
         return 'aadhaar'
+    
     # Driving Licence
     if 'DRIVING LICEN' in t or 'DRIVING LICENCE' in t or re.search(r'\bDL\d', t):
         return 'driving_license'
@@ -403,12 +417,15 @@ def detect_doc_type(text: str) -> str:
         return 'driving_license'
     if 'MAHARASHTRA STATE' in t and 'LICENCE' in t:
         return 'driving_license'
+    
     # Voter ID / EPIC
     if 'ELECTOR' in t or 'ELECTION' in t or 'EPIC' in t or re.search(r'\b[A-Z]{3}\d{7}\b', text):
         return 'voter_id'
-    # Fallback: try passport pattern
+    
+    # Fallback: try passport pattern (8-char alphanumeric starting with letter)
     if re.search(r'\b[A-Z]\d{7}\b', text):
         return 'passport'
+    
     return 'unknown'
 
 
@@ -864,42 +881,260 @@ def extract_voter(lines: List[str], text: str) -> Dict:
 
 
 def extract_passport(lines: List[str], text: str) -> Dict:
-    obj = {"doc_type": "passport", "passport_number": "", "name": "", "nationality": "", "dob": "", "place_of_birth": ""}
-    p_m = re.search(r'\b([A-Z]\d{7})\b', text)
-    if p_m:
-        obj['passport_number'] = p_m.group(1)
-    for i, ln in enumerate(lines):
-        u = ln.upper()
-        if 'NATIONALITY' in u:
-            obj['nationality'] = ln.split(':')[-1].strip() or nearest_line(lines, i, 1)
-        if 'SURNAME' in u or 'GIVEN NAME' in u or 'NAME' in u:
-            # passport MRZ style often has surname/given name
-            val = ln.split(':')[-1].strip()
-            if val:
-                obj['name'] = val
-            else:
-                obj['name'] = nearest_line(lines, i, 1)
-        if 'DATE OF BIRTH' in u or 'DOB' in u:
-            m = re.search(r'(\d{2}[\-\/]\d{2}[\-\/]\d{4}|\d{2}\s?[A-Z]{3}\s?\d{4})', ln)
+    obj = {
+        "doc_type": "passport", 
+        "passport_number": "", 
+        "name": "", 
+        "nationality": "", 
+        "dob": "", 
+        "place_of_birth": "", 
+        "gender": "",
+        "address": ""
+    }
+    
+    # 1. MRZ Strategy (Most Reliable)
+    # Look for lines containing '<<' which indicates MRZ
+    mrz_lines = [ln for ln in lines if '<<' in ln and len(ln) > 10]
+    
+    # Sort by length (MRZ lines are usually long)
+    mrz_lines.sort(key=len, reverse=True)
+    
+    if len(mrz_lines) >= 1:
+        # Try to identify Line 1 and Line 2
+        line1 = None
+        line2 = None
+        
+        for ln in mrz_lines:
+            # Line 1 starts with P (usually P<IND...) and contains name
+            if ln.startswith('P') and '<' in ln:
+                line1 = ln
+            # Line 2 starts with Passport Number (alphanumeric) and contains dates
+            # It usually has digits in specific places, but OCR might mess up.
+            # Heuristic: Line 2 usually contains 'IND' in the middle if Indian
+            elif re.search(r'\d', ln) and ('IND' in ln or '<' in ln):
+                line2 = ln
+        
+        # Parse Line 1: Name
+        if line1:
+            # Format: P<INDSURNAME<<GIVEN<NAME<<<<<<<<
+            # Strip P<IND or P<
+            try:
+                # Remove header
+                content = line1[5:] if line1.startswith('P<IND') else line1[2:]
+                # Split by << to separate Surname and Given Name
+                parts = content.split('<<')
+                surname = parts[0].replace('<', '').strip()
+                given_name = ""
+                if len(parts) > 1:
+                    given_name = parts[1].replace('<', ' ').strip()
+                
+                full_name = f"{given_name} {surname}".strip()
+                if full_name:
+                    obj['name'] = full_name
+            except:
+                pass
+
+        # Parse Line 2: Passport No, DOB, Gender, Expiry
+        if line2:
+            # Format: U8261051<9IND9809273M3103315...
+            # PassNo (9) + Chk(1) + Nat(3) + DOB(6) + Chk(1) + Sex(1) + Exp(6)
+            try:
+                # Passport Number: First 9 chars (replace < with nothing if short)
+                pp_no = line2[:9].replace('<', '')
+                if re.match(r'^[A-Z0-9]+$', pp_no):
+                    obj['passport_number'] = pp_no
+                
+                # Find IND to anchor
+                ind_idx = line2.find('IND')
+                if ind_idx != -1:
+                    # DOB is usually after IND (index + 3)
+                    dob_str = line2[ind_idx+3 : ind_idx+9]
+                    if re.match(r'\d{6}', dob_str):
+                        # YYMMDD -> DD/MM/YYYY
+                        yy = int(dob_str[0:2])
+                        mm = dob_str[2:4]
+                        dd = dob_str[4:6]
+                        # Pivot for century: if yy > 50 assume 19yy, else 20yy (adjust as needed)
+                        year = f"19{yy}" if yy > 30 else f"20{yy}"
+                        obj['dob'] = f"{dd}/{mm}/{year}"
+                    
+                    # Gender is usually after DOB + 1 check digit
+                    sex_char = line2[ind_idx+10]
+                    if sex_char in ['M', 'F']:
+                        obj['gender'] = 'Male' if sex_char == 'M' else 'Female'
+            except:
+                pass
+
+    # 2. Visual Label Strategy (Fallback or Supplement)
+    
+    # Passport Number (Top Right)
+    if not obj['passport_number']:
+        # Look for 8-digit alphanumeric starting with letter (e.g., U1234567)
+        # Often printed at top right
+        for ln in lines:
+            m = re.search(r'\b([A-Z][0-9]{7})\b', ln)
             if m:
-                obj['dob'] = m.group(1)
-            else:
-                obj['dob'] = nearest_line(lines, i, 1)
-        if 'PLACE OF BIRTH' in u or 'POB' in u:
-            obj['place_of_birth'] = ln.split(':')[-1].strip() or nearest_line(lines, i, 1)
-    # MRZ fallback: try to parse MRZ lines for name and passport number
-    mrz = [ln for ln in lines if '<<' in ln]
-    if mrz:
-        mrz_text = mrz[0]
-        # passport number is first 9 chars in MRZ usually
-        m = re.search(r'([A-Z0-9<]{9})', mrz_text)
-        if m and not obj['passport_number']:
-            obj['passport_number'] = m.group(1).replace('<', '')
-        # name part
-        parts = mrz_text.split('<<')
-        if len(parts) >= 2 and not obj['name']:
-            nm = parts[1].replace('<', ' ').strip()
-            obj['name'] = nm
+                obj['passport_number'] = m.group(1)
+                break
+
+    # Name - Enhanced extraction
+    if not obj['name']:
+        # Look for Surname and Given Name labels
+        surname = ""
+        given_name = ""
+        for i, ln in enumerate(lines):
+            if 'SURNAME' in ln.upper():
+                # Check same line first
+                val = re.sub(r'.*SURNAME[:\s]*', '', ln, flags=re.I).strip()
+                if val and len(val) > 2 and not re.search(r'GIVEN|NAME|SEX|DOB|INDIAN', val, re.I):
+                    surname = val
+                else:
+                    # Check next line
+                    val = nearest_line(lines, i, 1)
+                    if val and not re.search(r'GIVEN|NAME|SEX|DOB|INDIAN', val, re.I):
+                        surname = val
+            if 'GIVEN NAME' in ln.upper() or 'GIVEN' in ln.upper():
+                # Check same line first
+                val = re.sub(r'.*GIVEN\s*NAME[:\s]*', '', ln, flags=re.I).strip()
+                if val and len(val) > 2 and not re.search(r'SURNAME|SEX|DOB|INDIAN', val, re.I):
+                    given_name = val
+                else:
+                    # Check next line
+                    val = nearest_line(lines, i, 1)
+                    if val and not re.search(r'SURNAME|SEX|DOB|INDIAN', val, re.I):
+                        given_name = val
+        
+        if surname or given_name:
+            obj['name'] = f"{given_name} {surname}".strip()
+
+    # DOB - Enhanced extraction with multiple strategies
+    if not obj['dob']:
+        # Strategy 1: Look for explicit DOB/Date of Birth label
+        for i, ln in enumerate(lines):
+            if re.search(r'(DATE OF BIRTH|DOB|Date of Birth)', ln, re.I):
+                # Check same line
+                m = re.search(r'(\d{2}[\/\-]\d{2}[\/\-]\d{4})', ln)
+                if m:
+                    obj['dob'] = m.group(1)
+                    break
+                # Check next line
+                val = nearest_line(lines, i, 1)
+                m = re.search(r'(\d{2}[\/\-]\d{2}[\/\-]\d{4})', val)
+                if m:
+                    obj['dob'] = m.group(1)
+                    break
+        
+        # Strategy 2: Look for date pattern near "Sex" label (DOB usually appears before Sex)
+        if not obj['dob']:
+            for i, ln in enumerate(lines):
+                if re.search(r'\b(Sex|Gender)\b', ln, re.I):
+                    # Check previous lines for date
+                    for j in range(max(0, i-3), i):
+                        m = re.search(r'(\d{2}[\/\-]\d{2}[\/\-]\d{4})', lines[j])
+                        if m:
+                            obj['dob'] = m.group(1)
+                            break
+                    if obj['dob']:
+                        break
+
+    # Gender - Enhanced extraction
+    if not obj['gender']:
+        # Strategy 1: Look for Sex/Gender label
+        for i, ln in enumerate(lines):
+            if re.search(r'\b(Sex|Gender)\b', ln, re.I):
+                # Check same line
+                if re.search(r'\bM\b', ln):
+                    obj['gender'] = 'Male'
+                    break
+                elif re.search(r'\bF\b', ln):
+                    obj['gender'] = 'Female'
+                    break
+                # Check next line
+                val = nearest_line(lines, i, 1)
+                if re.search(r'\bM\b', val):
+                    obj['gender'] = 'Male'
+                    break
+                elif re.search(r'\bF\b', val):
+                    obj['gender'] = 'Female'
+                    break
+        
+        # Strategy 2: Look for standalone M or F near DOB
+        if not obj['gender']:
+            for ln in lines:
+                # Look for single letter M or F (not part of a word)
+                if re.search(r'\b(M|F)\b', ln) and len(ln.strip()) <= 3:
+                    if 'M' in ln:
+                        obj['gender'] = 'Male'
+                    else:
+                        obj['gender'] = 'Female'
+                    break
+
+    # Place of Birth - Enhanced extraction
+    if not obj['place_of_birth']:
+        for i, ln in enumerate(lines):
+            if re.search(r'(PLACE OF BIRTH|Place of Birth)', ln, re.I):
+                # Check same line first
+                val = re.sub(r'.*PLACE OF BIRTH[:\s]*', '', ln, flags=re.I).strip()
+                if val and len(val) > 2 and not re.search(r'PLACE|ISSUE|DATE|FILE', val, re.I):
+                    obj['place_of_birth'] = val
+                    break
+                # Check next line
+                val = nearest_line(lines, i, 1)
+                if val and not re.search(r'PLACE|ISSUE|DATE|FILE|SEX|GENDER', val, re.I):
+                    obj['place_of_birth'] = val
+                    break
+
+    # Nationality
+    if not obj['nationality']:
+        # Look for explicit nationality label
+        for i, ln in enumerate(lines):
+            if re.search(r'(Nationality|NATIONALITY)', ln):
+                val = re.sub(r'.*Nationality[:\s]*', '', ln, flags=re.I).strip()
+                if val and len(val) > 2:
+                    obj['nationality'] = val
+                    break
+                val = nearest_line(lines, i, 1)
+                if val and not re.search(r'DATE|PLACE|SEX', val, re.I):
+                    obj['nationality'] = val
+                    break
+        
+        # Default to INDIAN if not found but document is Indian passport
+        if not obj['nationality'] and ('REPUBLIC OF INDIA' in text.upper() or 'IND' in text):
+            obj['nationality'] = 'INDIAN'
+
+    # Address (Back Page) - Enhanced extraction
+    if not obj['address']:
+        for i, ln in enumerate(lines):
+            if re.search(r'\b(Address|ADDRESS)\b', ln):
+                addr_parts = []
+                # Collect lines below "Address" until we hit another label or PIN
+                for j in range(i + 1, min(len(lines), i + 15)):
+                    next_ln = lines[j].strip()
+                    if not next_ln: 
+                        continue
+                    
+                    # Stop at common footer labels (but include PIN line)
+                    if re.search(r'(FILE|OLD PASSPORT|Date of Issue|Place of Issue)', next_ln, re.I):
+                        break
+                    
+                    # Include PIN line and stop
+                    if re.search(r'PIN\s*[:\s]*\d{6}', next_ln, re.I):
+                        addr_parts.append(next_ln)
+                        break
+                    
+                    # Skip lines that look like labels
+                    if re.search(r'^(Father|Mother|Spouse|Name of)', next_ln, re.I):
+                        continue
+                    
+                    addr_parts.append(next_ln)
+                
+                if addr_parts:
+                    obj['address'] = ", ".join(addr_parts)
+                    # Clean up the address
+                    obj['address'] = re.sub(r'\s*,\s*,\s*', ', ', obj['address'])
+                    obj['address'] = re.sub(r'^,\s*|,\s*$', '', obj['address'])
+                    break
+
     return obj
 
 
@@ -1108,6 +1343,7 @@ def canonicalize(structured: Dict, raw_text: str = "") -> Dict:
         out['passport_no'] = structured.get('passport_number', '')
         out['nationality'] = structured.get('nationality', '')
         out['place_of_birth'] = structured.get('place_of_birth', '')
+        out['gender'] = structured.get('gender', '')
 
     return out
 
