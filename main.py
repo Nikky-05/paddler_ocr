@@ -1,6 +1,3 @@
-
-
-
 """
 FastAPI OCR Application for Indian Identity Documents
 Single-file implementation with uniform response schema
@@ -20,13 +17,15 @@ import asyncio
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from PIL import Image, ImageEnhance, ImageFilter
 from werkzeug.utils import secure_filename
@@ -499,27 +498,19 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
 
     # Read file into memory buffer (no disk storage)
     content = await file.read()
-    img = Image.open(BytesIO(content)).convert('RGB')
-    
-    # Save original image to ocr folder for debugging
-    os.makedirs("ocr", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    img.save(f"ocr/{timestamp}_original.jpg")
-    print(f"[OCR DEBUG] Saved original image: ocr/{timestamp}_original.jpg")
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty")
 
+    try:
+        img = Image.open(BytesIO(content)).convert('RGB')
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file or format")
+    
     # Run OCR on original image (no preprocessing)
     records = ocr_records_from_image(img, doc_type)
     lines = [r['text'] for r in records]
     text = "\n".join(lines)
     
-    # Save OCR extracted text to file for debugging
-    with open(f"ocr/{timestamp}_extracted_text.txt", "w", encoding="utf-8") as f:
-        f.write("===== OCR EXTRACTED TEXT =====\n\n")
-        for i, r in enumerate(records):
-            f.write(f"Line {i}: {r['text']} (confidence: {r.get('confidence', 0):.2f}, y: {r.get('y', 0):.0f})\n")
-        f.write(f"\n===== TOTAL LINES: {len(records)} =====\n")
-    print(f"[OCR DEBUG] Saved extracted text: ocr/{timestamp}_extracted_text.txt")
-
     # Extract based on document type
     if doc_type == 'aadhaar':
         extracted = extract_aadhaar(lines, text, records)
@@ -579,6 +570,91 @@ class VerifyResponse(BaseModel):
     match: bool
     threshold: float
     percent_similarity: float
+
+
+class ErrorResponse(BaseModel):
+    success: bool = False
+    message: str
+    error_code: str
+    data: Optional[Dict] = None
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Override default 422 validation error."""
+    # Build a friendly message from the errors
+    errors = exc.errors()
+    if errors:
+        err = errors[0]
+        field = err.get("loc", ["Unknown"])[-1]
+        msg = f"Field '{field}' is {err.get('msg', 'invalid')}"
+        # Special case for "field required"
+        if err.get("type") == "missing":
+            msg = f"{field.replace('_', ' ').capitalize()} is required"
+    else:
+        msg = "Validation error"
+
+    return JSONResponse(
+        status_code=400,
+        content=ErrorResponse(
+            success=False,
+            message=msg,
+            error_code="Validation_Error"
+        ).model_dump()
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Override default HTTPException handler."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            success=False,
+            message=str(exc.detail),
+            error_code="Service_Error"
+        ).model_dump()
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Catch-all for internal server errors."""
+    print(f"INTERNAL ERROR: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            success=False,
+            message="Internal Server Error",
+            error_code="SERVER_ERROR"
+        ).model_dump()
+    )
+
+
+@app.get("/")
+async def root():
+    """
+    API Information and Documentation.
+    """
+    return {
+        "message": "OCR & Face Verification API",
+        "version": "1.0.0",
+        "status": "online",
+        "endpoints": {
+            "health": "/health",
+            "ocr": "/api/ocr (POST)",
+            "verify": "/verify (POST)",
+            "docs": "/docs",
+            "redoc": "/redoc"
+        },
+        "document_types": {
+            "A": "Passport",
+            "B": "Voter ID",
+            "C": "PAN Card",
+            "D": "Driving License",
+            "E": "Aadhaar"
+        }
+    }
 
 
 @app.get("/health", response_model=HealthResponse)
