@@ -2,6 +2,10 @@
 FastAPI OCR Application for Indian Identity Documents
 Single-file implementation with uniform response schema
 
+Supported Formats:
+  - Images: PNG, JPG, JPEG, JFIF, WEBP
+  - Documents: PDF (first page only)
+
 Document Types:
   - A: Passport
   - B: Voter ID
@@ -31,6 +35,7 @@ from PIL import Image, ImageEnhance, ImageFilter
 from werkzeug.utils import secure_filename
 import torch
 from facenet_pytorch import MTCNN, InceptionResnetV1
+import fitz  # PyMuPDF for PDF processing
 
 # OCR Engine State
 OCR = None
@@ -39,7 +44,7 @@ OCR_ERROR = None
 
 # ============ Face Verification Setup ============
 UPLOAD_FOLDER = "uploads"
-ALLOWED_EXT = {"png", "jpg", "jpeg", "jfif", "webp"}
+ALLOWED_EXT = {"png", "jpg", "jpeg", "jfif", "webp", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Face detection device and models
@@ -464,6 +469,47 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def pdf_to_images(pdf_bytes: bytes) -> List[Image.Image]:
+    """
+    Convert PDF bytes to list of PIL Images (one per page).
+    
+    Args:
+        pdf_bytes: PDF file content as bytes
+        
+    Returns:
+        List of PIL Image objects, one for each page
+        
+    Raises:
+        ValueError: If PDF is invalid or cannot be processed
+    """
+    try:
+        # Open PDF from bytes
+        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        images = []
+        
+        # Convert each page to image
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            # Render page to image at 300 DPI for better OCR quality
+            mat = fitz.Matrix(300/72, 300/72)  # 300 DPI scaling
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Convert to PIL Image
+            img_bytes = pix.tobytes("png")
+            img = Image.open(BytesIO(img_bytes)).convert('RGB')
+            images.append(img)
+        
+        pdf_document.close()
+        
+        if not images:
+            raise ValueError("PDF contains no pages")
+            
+        return images
+        
+    except Exception as e:
+        raise ValueError(f"Failed to process PDF: {str(e)}")
+
+
 # ============ Document Extractors ============
 # Import extractors from separate modules
 
@@ -501,10 +547,25 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file is empty")
 
-    try:
-        img = Image.open(BytesIO(content)).convert('RGB')
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image file or format")
+    # Check if file is PDF or image
+    file_ext = file.filename.lower().split('.')[-1] if file.filename else ''
+    
+    if file_ext == 'pdf':
+        # Process PDF: convert to images and process first page
+        try:
+            images = pdf_to_images(content)
+            # Process first page (most PDFs of ID documents are single page)
+            img = images[0]
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to process PDF: {str(e)}")
+    else:
+        # Process as image
+        try:
+            img = Image.open(BytesIO(content)).convert('RGB')
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image file or format")
     
     # Run OCR on original image (no preprocessing)
     records = ocr_records_from_image(img, doc_type)
@@ -653,7 +714,8 @@ async def root():
             "C": "PAN Card",
             "D": "Driving License",
             "E": "Aadhaar"
-        }
+        },
+        "supported_formats": ["png", "jpg", "jpeg", "jfif", "webp", "pdf"]
     }
 
 
@@ -677,18 +739,22 @@ async def health_check():
 
 @app.post("/api/ocr", response_model=OCRResponse)
 async def ocr_extract(
-    file: UploadFile = File(..., description="Document image file"),
+    file: UploadFile = File(..., description="Document image or PDF file (png, jpg, jpeg, jfif, webp, pdf)"),
     doc_type: str = Form(..., description="Document type code: A (Passport), B (Voter ID), C (PAN), D (Driving License), E (Aadhaar)")
 ):
     """
     Extract data from identity document.
 
+    Supported Formats: PNG, JPG, JPEG, JFIF, WEBP, PDF
+    
     Document Type Codes:
     - A: Passport
     - B: Voter ID
     - C: PAN Card
     - D: Driving License
     - E: Aadhaar
+    
+    Note: For PDF files, only the first page will be processed.
     """
     result = await process_document(file, doc_type)
     return result
