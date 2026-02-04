@@ -702,7 +702,7 @@ async def root():
         "version": "1.0.0",
         "status": "online",
         "endpoints": {
-            "health": "/health",
+            "health": "/api/health",
             "ocr": "/api/ocr (POST)",
             "verify": "/verify (POST)",
             "docs": "/docs",
@@ -719,7 +719,7 @@ async def root():
     }
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/api/health", response_model=HealthResponse)
 async def health_check():
     """
     Health check endpoint with OCR status.
