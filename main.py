@@ -521,6 +521,9 @@ from extractors import (
     extract_passport
 )
 
+# Import document validator
+from extractors.document_validator import validate_document_type
+
 # Legacy function for compatibility (now imported from extractors.utils)
 from extractors.utils import nearest_line
 
@@ -571,6 +574,15 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
     records = ocr_records_from_image(img, doc_type)
     lines = [r['text'] for r in records]
     text = "\n".join(lines)
+    
+    # Validate document type
+    is_valid_document = validate_document_type(doc_type, lines, text)
+    
+    if not is_valid_document:
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid Document"
+        )
     
     # Extract based on document type
     if doc_type == 'aadhaar':
