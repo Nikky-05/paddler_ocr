@@ -8,12 +8,15 @@ from .driving_license import extract_driving_license
 from .pan import extract_pan
 from .voter import extract_voter
 from .passport import extract_passport
+from .utils import mergeOcrIntoResponse, split_address
 
 __all__ = [
     'extract_aadhaar',
     'extract_driving_license',
     'extract_pan',
     'extract_voter',
-    'extract_passport'
+    'extract_passport',
+    'mergeOcrIntoResponse',
+    'split_address',
 ]
 

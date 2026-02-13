@@ -17,7 +17,14 @@ Usage:
   uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
+# Disable oneDNN to avoid compatibility issues
+import os
+os.environ['FLAGS_use_mkldnn'] = '0'
+os.environ['MKLDNN_VERBOSE'] = '0'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 import asyncio
+import base64
 import os
 import re
 from contextlib import asynccontextmanager
@@ -31,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from werkzeug.utils import secure_filename
 import torch
 from facenet_pytorch import MTCNN, InceptionResnetV1
@@ -78,13 +85,13 @@ def _init_ocr():
     Enhanced for detecting DOB and other small text in PVC/Short Aadhaar cards.
     """
     from paddleocr import PaddleOCR
-    
-    # Using only core parameters that are universally supported
+
+    # PaddleOCR 3.x parameters
     return PaddleOCR(
         lang='en',
-        det_db_thresh=0.2,                 # Lower threshold = more sensitive text detection
-        det_db_box_thresh=0.4,             # Accept lower confidence text boxes
-        use_angle_cls=True                 # Detect rotated text
+        use_textline_orientation=True,
+        text_det_thresh=0.2,
+        text_det_box_thresh=0.4
     )
 
 
@@ -109,6 +116,27 @@ class FieldValue(BaseModel):
     confidence: float
 
 
+class AddressSplit(BaseModel):
+    building: str = ""
+    city: str = ""
+    district: str = ""
+    pin: str = ""
+    floor: str = ""
+    house: str = ""
+    locality: str = ""
+    state: str = ""
+    street: str = ""
+    complex: str = ""
+    landmark: str = ""
+    untagged: str = ""
+
+
+class AdditionalDetails(BaseModel):
+    faceDetected: bool = False
+    faceImage: str = ""
+    addressSplit: AddressSplit = AddressSplit()
+
+
 class OCRResponse(BaseModel):
     doc_type: str
     aadhaar: FieldValue
@@ -130,6 +158,7 @@ class OCRResponse(BaseModel):
     issue_date: FieldValue
     blood_group: FieldValue
     cov: FieldValue
+    additionalDetails: Optional[AdditionalDetails] = None
 
 
 def empty_field() -> Dict:
@@ -281,7 +310,7 @@ def is_english_text(text: str) -> bool:
 
 def ocr_records_from_image(img: Image.Image, doc_type: str = None) -> List[Dict]:
     """Run OCR on PIL Image and return list of records with text, confidence, and y-position.
-    
+
     Args:
         img: PIL Image to process
         doc_type: Document type ('aadhaar', 'pan', 'driving_license', 'voter_id', 'passport')
@@ -289,17 +318,45 @@ def ocr_records_from_image(img: Image.Image, doc_type: str = None) -> List[Dict]
     """
     ocr = get_ocr()
 
-    def parse_result(res) -> List[Dict]:
-        """Parse OCR result from PaddleOCR predict() method."""
+    def parse_result_v2(res) -> List[Dict]:
+        """Parse OCR result from PaddleOCR 2.x ocr() method."""
         recs = []
         if not res or not isinstance(res, list) or len(res) == 0:
             return recs
 
-        # PaddleOCR 3.3.2 returns list of OCRResult objects
-        # Each has: rec_texts, rec_scores, rec_polys
         page = res[0]
+        if not page:
+            return recs
 
-        # Handle OCRResult object (has dict-like access)
+        for item in page:
+            try:
+                box = item[0]
+                text_info = item[1]
+                txt = text_info[0]
+                conf = float(text_info[1])
+
+                if not txt or not str(txt).strip():
+                    continue
+
+                if doc_type != 'aadhaar' and not is_english_text(str(txt)):
+                    continue
+
+                y = int(min([p[1] for p in box]))
+                x = int(min([p[0] for p in box]))
+
+                recs.append({"text": str(txt).strip(), "conf": conf, "y": y, "x": x})
+            except Exception:
+                continue
+
+        return recs
+
+    def parse_result_v3(res) -> List[Dict]:
+        """Parse OCR result from PaddleOCR 3.x predict() method."""
+        recs = []
+        if not res or not isinstance(res, list) or len(res) == 0:
+            return recs
+
+        page = res[0]
         try:
             texts = page.get('rec_texts', []) if hasattr(page, 'get') else getattr(page, 'rec_texts', [])
             scores = page.get('rec_scores', []) if hasattr(page, 'get') else getattr(page, 'rec_scores', [])
@@ -310,25 +367,38 @@ def ocr_records_from_image(img: Image.Image, doc_type: str = None) -> List[Dict]
         for idx, txt in enumerate(texts):
             if not txt or not str(txt).strip():
                 continue
-            # For Aadhaar: Keep ALL text (including Devanagari) for name extraction
-            # For other docs: Filter to English only (existing behavior)
             if doc_type != 'aadhaar' and not is_english_text(str(txt)):
                 continue
             conf = float(scores[idx]) if idx < len(scores) else 0.0
-            # Get y-position and x-position from polygon
             poly = polys[idx] if idx < len(polys) else None
-            y = 0
-            x = 0
+            y, x = 0, 0
             if poly is not None:
                 try:
                     y = int(min([p[1] for p in poly]))
                     x = int(min([p[0] for p in poly]))
                 except Exception:
-                    y = 0
-                    x = 0
+                    pass
             recs.append({"text": str(txt).strip(), "conf": conf, "y": y, "x": x})
 
         return recs
+
+    def run_ocr(image_array):
+        """Run OCR handling both v2 and v3 API."""
+        # Try v2 API first (ocr method)
+        try:
+            res = ocr.ocr(image_array, cls=True)
+            return parse_result_v2(res)
+        except (AttributeError, TypeError):
+            pass
+
+        # Try v3 API (predict method)
+        try:
+            res = ocr.predict(image_array)
+            return parse_result_v3(res)
+        except Exception:
+            pass
+
+        return []
 
     results = []
 
@@ -340,21 +410,19 @@ def ocr_records_from_image(img: Image.Image, doc_type: str = None) -> List[Dict]
             new_h = int(h * (1600 / w))
             img_pass1 = img_pass1.resize((1600, new_h), Image.LANCZOS)
 
-        # Use predict() method (new API)
-        res1 = ocr.predict(np.array(img_pass1))
-        parsed1 = parse_result(res1)
+        parsed1 = run_ocr(np.array(img_pass1))
         results.extend(parsed1)
 
-        # Early exit if good enough
-        if parsed1:
+        # Early exit if good enough (skip for PAN cards — they need extra passes for name accuracy)
+        if parsed1 and doc_type != 'pan':
             avg_conf = sum(r['conf'] for r in parsed1) / len(parsed1)
             full_text = " ".join([r['text'] for r in parsed1]).upper()
             keywords = ['INCOME TAX', 'PERMANENT ACCOUNT', 'AADHAAR', 'GOVERNMENT OF INDIA',
                        'DRIVING LICEN', 'ELECTION COMMISSION', 'PASSPORT', 'REPUBLIC OF INDIA']
             if any(k in full_text for k in keywords) and avg_conf > 0.80:
                 return merge_results(results)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DEBUG] OCR Pass 1 error: {e}")
 
     # Pass 2: Preprocessed image
     try:
@@ -369,11 +437,33 @@ def ocr_records_from_image(img: Image.Image, doc_type: str = None) -> List[Dict]
         img_pass2 = enhancer.enhance(1.6)
         img_pass2 = img_pass2.filter(ImageFilter.SHARPEN)
 
-        # Use predict() method (new API)
-        res2 = ocr.predict(np.array(img_pass2))
-        results.extend(parse_result(res2))
-    except Exception:
-        pass
+        parsed2 = run_ocr(np.array(img_pass2))
+        results.extend(parsed2)
+    except Exception as e:
+        print(f"[DEBUG] OCR Pass 2 error: {e}")
+
+    # Pass 3 (PAN-specific): Grayscale + binarization for cleaner text recognition
+    # PAN cards often have low-contrast text that benefits from thresholding
+    if doc_type == 'pan':
+        try:
+            img_pass3 = img.copy().convert('L')  # Grayscale
+            img_pass3 = ImageOps.autocontrast(img_pass3, cutoff=5)
+
+            # Upscale for better OCR accuracy
+            w, h = img_pass3.size
+            if w < 1400:
+                scale = 1400 / w
+                new_h = int(h * scale)
+                img_pass3 = img_pass3.resize((1400, new_h), Image.LANCZOS)
+
+            # Binarize: pure black/white separates text from background
+            img_pass3 = img_pass3.point(lambda x: 0 if x < 128 else 255, '1')
+            img_pass3 = img_pass3.convert('RGB')
+
+            parsed3 = run_ocr(np.array(img_pass3))
+            results.extend(parsed3)
+        except Exception as e:
+            print(f"[DEBUG] OCR Pass 3 (PAN binarization) error: {e}")
 
     return merge_results(results)
 
@@ -518,7 +608,8 @@ from extractors import (
     extract_driving_license,
     extract_pan,
     extract_voter,
-    extract_passport
+    extract_passport,
+    split_address,
 )
 
 # Import document validator
@@ -526,6 +617,35 @@ from extractors.document_validator import validate_document_type
 
 # Legacy function for compatibility (now imported from extractors.utils)
 from extractors.utils import nearest_line
+
+
+def detect_face_in_document(img: Image.Image) -> dict:
+    """Detect a face in a document image and return base64-encoded face crop.
+
+    Uses the global ``mtcnn`` instance for detection only (no embedding).
+    Returns {"faceDetected": bool, "faceImage": str} where faceImage is a
+    base64-encoded JPEG of the cropped face region, or "" if no face found.
+    Never raises - failures are treated as no-face-detected.
+    """
+    try:
+        boxes, _ = mtcnn.detect(img)
+        if boxes is not None and len(boxes) > 0:
+            box = boxes[0]  # first face
+            x1, y1, x2, y2 = [int(coord) for coord in box]
+            # Add 10px margin, clamped to image bounds
+            w, h = img.size
+            x1 = max(0, x1 - 10)
+            y1 = max(0, y1 - 10)
+            x2 = min(w, x2 + 10)
+            y2 = min(h, y2 + 10)
+            face_crop = img.crop((x1, y1, x2, y2))
+            buf = BytesIO()
+            face_crop.save(buf, format="JPEG")
+            face_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            return {"faceDetected": True, "faceImage": face_b64}
+    except Exception as e:
+        print(f"[DEBUG] Face detection error: {e}")
+    return {"faceDetected": False, "faceImage": ""}
 
 
 # ============ Main Processing ============
@@ -577,10 +697,10 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
     
     # Validate document type
     is_valid_document = validate_document_type(doc_type, lines, text)
-    
+
     if not is_valid_document:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="Invalid Document"
         )
     
@@ -588,7 +708,7 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
     if doc_type == 'aadhaar':
         extracted = extract_aadhaar(lines, text, records)
     elif doc_type == 'pan':
-        extracted = extract_pan(lines, text)
+        extracted = extract_pan(lines, text, records)
     elif doc_type == 'driving_license':
         extracted = extract_driving_license(lines, text)
     elif doc_type == 'voter_id':
@@ -600,6 +720,16 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
 
     # Create uniform response
     response = create_uniform_response(doc_type, extracted, records)
+
+    # Compute additionalDetails
+    face_info = detect_face_in_document(img)
+    address_split = split_address(response["address"]["value"])
+    response["additionalDetails"] = {
+        "faceDetected": face_info["faceDetected"],
+        "faceImage": face_info["faceImage"],
+        "addressSplit": address_split,
+    }
+
     return response
 
 
@@ -840,4 +970,4 @@ async def verify_faces(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

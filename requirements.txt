@@ -10,3 +10,4 @@ torchvision
 facenet-pytorch
 werkzeug
 PyMuPDF>=1.23.0
+langchain==0.0.352

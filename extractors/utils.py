@@ -200,8 +200,9 @@ def has_reasonable_vowel_ratio(s: str) -> bool:
     if total_letters == 0: return False
     vowels = sum(1 for c in s_up if c in "AEIOUY") # Y is often vowel-ish in names
     ratio = vowels / total_letters
-    # Most names have > 20% vowels. Garbage fragments like "HRG" or "JHTST" have 0%.
-    return ratio >= 0.20
+    # Real names have at least ~25-30% vowels. Garbage fragments like "HRG" have 0%.
+    # Increased from 20% to filter out more OCR noise
+    return ratio >= 0.25
 
 
 def is_likely_garbage(s: str) -> bool:
@@ -215,15 +216,18 @@ def is_likely_garbage(s: str) -> bool:
 
     # If it's just a bunch of random caps like "IBJ" or "FABL" that aren't common names
     garbage_patterns = [
-        r'\b(DOW|FABL|IBJ|HBI|TIO|LLC|PAE|HRG|HRCR|FLSH|JHTST|USIT|JHT|USI|HTS|TST)\b',  # Specific OCR noise
+        r'\b(DOW|FABL|IBJ|HBI|TIO|LLC|PAE|HRG|HRCR|HRCOR|FLSH|JHTST|USIT|JHT|USI|HTS|TST)\b',  # Specific OCR noise
     ]
     
     # Consonants only check (excluding Y which is common in names)
     consonant_block = r'^[BCDFGHJKLMNPQRSTVWXZ]{2,}$'
     
+    # Pattern for words with too many consecutive consonants (> 3 in a row is unusual)
+    excessive_consonants = r'[BCDFGHJKLMNPQRSTVWXZ]{4,}'
+    
     for w in words:
         w_up = w.upper()
-        # 1. Check specific noise
+        # 1. Check specific noise patterns
         for p in garbage_patterns:
             if re.search(p, w_up):
                 return True
@@ -232,6 +236,9 @@ def is_likely_garbage(s: str) -> bool:
             return True
         # 3. Check for mixed alphanumeric word which is rare in names
         if any(c.isdigit() for c in w) and any(c.isalpha() for c in w):
+            return True
+        # 4. Check for excessive consecutive consonants (SHRG, HRCOR pattern)
+        if re.search(excessive_consonants, w_up):
             return True
 
     return False
@@ -260,6 +267,277 @@ def contains_devanagari(text: str) -> bool:
     if not text:
         return False
     return any('\u0900' <= char <= '\u097F' for char in text)
+
+
+def _safe_get(data, *keys):
+    """Safely traverse nested dicts/lists. Returns None if any key is missing or types mismatch."""
+    current = data
+    for key in keys:
+        if current is None:
+            return None
+        if isinstance(key, int):
+            if isinstance(current, (list, tuple)) and 0 <= key < len(current):
+                current = current[key]
+            else:
+                return None
+        elif isinstance(current, dict):
+            current = current.get(key)
+        else:
+            return None
+    return current
+
+
+def _map_dl_fields(merged, ocr_data):
+    """Map DL-specific OCR fields into the merged response.
+
+    Mapping: ocrData.dlNo → dl_number, name → name, dob → dob,
+             relationName → father (if present), address → address.
+    """
+    field_map = {
+        "dlNo": "dl_number",
+        "name": "name",
+        "dob": "dob",
+        "address": "address",
+    }
+
+    for ocr_key, response_key in field_map.items():
+        ocr_field = _safe_get(ocr_data, ocr_key) or {}
+        ocr_value = _safe_get(ocr_field, "value")
+
+        if ocr_value is not None and ocr_value != "":
+            if not isinstance(merged.get(response_key), dict):
+                merged[response_key] = {"value": "", "confidence": 0}
+            merged[response_key]["value"] = ocr_value
+            ocr_conf = _safe_get(ocr_field, "confidence")
+            if ocr_conf is not None:
+                merged[response_key]["confidence"] = ocr_conf
+
+    relation_field = _safe_get(ocr_data, "relationName") or {}
+    relation_value = _safe_get(relation_field, "value")
+    if relation_value is not None and relation_value != "":
+        if not isinstance(merged.get("father"), dict):
+            merged["father"] = {"value": "", "confidence": 0}
+        merged["father"]["value"] = relation_value
+        relation_conf = _safe_get(relation_field, "confidence")
+        if relation_conf is not None:
+            merged["father"]["confidence"] = relation_conf
+
+
+def mergeOcrIntoResponse(existingResponse, ocrPayload, isDocumentUploaded):
+    """Merge an existing response packet with an OCR payload.
+
+    Rules:
+    - Preserves the existing schema and all original values by default.
+    - Copies ``data.result.documents[0].additionalDetails`` from *ocrPayload*
+      into the merged result without modifying keys or structure.
+    - Sets ``additionalDetails.faceDetected = True`` only when
+      *isDocumentUploaded* is truthy **and** a face/image field is present
+      in the OCR payload document; otherwise ``False``.
+    - If ``documents[0].ocrData.address.value`` exists, overrides the
+      response ``address.value`` and ``address.confidence`` with OCR values.
+    - When ``documentType == "DL"``, maps DL-specific OCR fields
+      (dlNo, name, dob, relationName, address) into the response.
+    - All null / missing fields are handled safely without crashing.
+
+    Returns the final merged dict.
+    """
+    import copy
+
+    merged = copy.deepcopy(existingResponse) if existingResponse else {}
+
+    if not ocrPayload:
+        merged.setdefault("additionalDetails", {"faceDetected": False})
+        return merged
+
+    document = _safe_get(ocrPayload, "data", "result", "documents", 0)
+
+    if document is None:
+        merged.setdefault("additionalDetails", {"faceDetected": False})
+        return merged
+
+    ocr_data = _safe_get(document, "ocrData") or {}
+    document_type = _safe_get(document, "documentType") or ""
+
+    # --- additionalDetails (preserve structure exactly) ---
+    additional_details = copy.deepcopy(_safe_get(document, "additionalDetails") or {})
+
+    face_detected = False
+    if isDocumentUploaded:
+        face_image = (
+            _safe_get(document, "faceImage")
+            or _safe_get(document, "image")
+            or _safe_get(document, "photo")
+            or _safe_get(additional_details, "faceImage")
+            or _safe_get(additional_details, "image")
+            or _safe_get(ocr_data, "photo", "value")
+            or _safe_get(ocr_data, "image", "value")
+        )
+        if face_image:
+            face_detected = True
+
+    additional_details["faceDetected"] = face_detected
+    merged["additionalDetails"] = additional_details
+
+    # --- address override ---
+    ocr_address = _safe_get(ocr_data, "address") or {}
+    ocr_address_value = _safe_get(ocr_address, "value")
+
+    if ocr_address_value is not None and ocr_address_value != "":
+        if not isinstance(merged.get("address"), dict):
+            merged["address"] = {"value": "", "confidence": 0}
+        merged["address"]["value"] = ocr_address_value
+        ocr_address_conf = _safe_get(ocr_address, "confidence")
+        if ocr_address_conf is not None:
+            merged["address"]["confidence"] = ocr_address_conf
+
+    # --- DL-specific mapping ---
+    if document_type == "DL":
+        _map_dl_fields(merged, ocr_data)
+
+    return merged
+
+
+INDIAN_STATES = [
+    "andhra pradesh", "arunachal pradesh", "assam", "bihar", "chhattisgarh",
+    "goa", "gujarat", "haryana", "himachal pradesh", "jharkhand", "karnataka",
+    "kerala", "madhya pradesh", "maharashtra", "manipur", "meghalaya",
+    "mizoram", "nagaland", "odisha", "orissa", "punjab", "rajasthan",
+    "sikkim", "tamil nadu", "telangana", "tripura", "uttar pradesh",
+    "uttarakhand", "west bengal", "delhi", "new delhi", "chandigarh",
+    "puducherry", "pondicherry", "jammu and kashmir", "jammu & kashmir",
+    "ladakh", "andaman and nicobar", "dadra and nagar haveli",
+    "daman and diu", "lakshadweep",
+]
+
+
+def split_address(address_str: str) -> dict:
+    """Split an Indian address string into structured components.
+
+    Returns a dict with keys: building, city, district, pin, floor, house,
+    locality, state, street, complex, landmark, untagged.
+    All values are strings (empty string when not detected).
+    Pure function - never raises.
+    """
+    result = {
+        "building": "",
+        "city": "",
+        "district": "",
+        "pin": "",
+        "floor": "",
+        "house": "",
+        "locality": "",
+        "state": "",
+        "street": "",
+        "complex": "",
+        "landmark": "",
+        "untagged": "",
+    }
+
+    if not address_str or not address_str.strip():
+        return result
+
+    addr = address_str.strip()
+
+    # --- PIN code (6-digit Indian postal code) ---
+    pin_match = re.search(r'\b(\d{6})\b', addr)
+    if pin_match:
+        result["pin"] = pin_match.group(1)
+        addr = addr[:pin_match.start()] + addr[pin_match.end():]
+
+    # --- State ---
+    addr_lower = addr.lower()
+    for state in sorted(INDIAN_STATES, key=len, reverse=True):
+        pattern = r'\b' + re.escape(state) + r'\b'
+        m = re.search(pattern, addr_lower)
+        if m:
+            result["state"] = addr[m.start():m.end()].strip()
+            addr = addr[:m.start()] + addr[m.end():]
+            break
+
+    # --- District ---
+    dist_match = re.search(r'\b(?:dist(?:rict)?|distt?)[\s.:~-]*([A-Za-z\s]+)', addr, re.I)
+    if dist_match:
+        result["district"] = dist_match.group(1).strip().strip(',').strip()
+        addr = addr[:dist_match.start()] + addr[dist_match.end():]
+
+    # Work with comma-separated parts for the remaining fields
+    parts = [p.strip() for p in re.split(r'[,\n]+', addr) if p.strip()]
+    remaining = []
+
+    for part in parts:
+        part_lower = part.lower().strip()
+
+        # --- House number (e.g., "H.No 123", "No. 45", "1-2-3/4", "#123") ---
+        if not result["house"] and re.match(
+            r'^(?:h\.?\s*no\.?\s*|no\.?\s*|#\s*)?\d[\d\-/\\a-zA-Z]*$', part_lower
+        ):
+            result["house"] = part.strip()
+            continue
+
+        # --- Floor ---
+        if not result["floor"] and re.search(
+            r'\b(\d+\s*(?:st|nd|rd|th)\s*floor|ground\s*floor|basement)\b', part_lower
+        ):
+            result["floor"] = part.strip()
+            continue
+
+        # --- Landmark ---
+        if not result["landmark"] and re.match(
+            r'\b(?:near|behind|opp(?:osite)?|beside|adjacent|next\s+to|in\s+front\s+of)\b',
+            part_lower
+        ):
+            result["landmark"] = part.strip()
+            continue
+
+        # --- Street ---
+        if not result["street"] and re.search(
+            r'\b(?:road|rd|street|st|lane|marg|path|gali|gully|chowk|cross)\b', part_lower
+        ):
+            result["street"] = part.strip()
+            continue
+
+        # --- Building ---
+        if not result["building"] and re.search(
+            r'\b(?:building|bldg|tower|plaza|bhawan|bhavan|mansion|house)\b', part_lower
+        ):
+            result["building"] = part.strip()
+            continue
+
+        # --- Complex (apartment/society/complex) ---
+        if not result["complex"] and re.search(
+            r'\b(?:apartment|apt|society|complex|residency|enclave|heights|villa|park)\b',
+            part_lower
+        ):
+            result["complex"] = part.strip()
+            continue
+
+        # --- Locality (nagar/colony/sector/ward/area/mohalla etc.) ---
+        if not result["locality"] and re.search(
+            r'\b(?:nagar|colony|sector|ward|area|mohalla|mohala|puram|puri|bagh|'
+            r'vihar|kunj|block|phase|extension|extn|layout|scheme|circle|'
+            r'town|village|vill|post|po|tehsil|taluka|mandal|hobli)\b',
+            part_lower
+        ):
+            result["locality"] = part.strip()
+            continue
+
+        # --- City (capitalized word that doesn't match other patterns) ---
+        # Assign first unmatched part with 2+ alpha words or a single capitalized word as city
+        if not result["city"] and re.match(r'^[A-Za-z][A-Za-z\s]+$', part.strip()):
+            result["city"] = part.strip()
+            continue
+
+        remaining.append(part.strip())
+
+    # Anything left goes to untagged
+    untagged = ", ".join(remaining).strip(", ").strip()
+    result["untagged"] = untagged
+
+    # Clean up trailing/leading commas and whitespace in all fields
+    for key in result:
+        result[key] = re.sub(r'^[\s,]+|[\s,]+$', '', result[key])
+
+    return result
 
 
 def is_title_case_name(text: str) -> bool:
