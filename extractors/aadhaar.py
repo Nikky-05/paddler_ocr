@@ -425,7 +425,8 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
         'government', 'india', 'aadhaar', 'uidai', 'unique', 'identification',
         'authority', 'enrolment', 'enrollment', 'issue', 'date', 'download',
         'print', 'proof', 'identity', 'citizenship', 'address', 'help@',
-        'www.', 'mera', 'meri', 'pahchan', 'signature', 'valid'
+        'www.', 'mera', 'meri', 'pahchan', 'signature', 'valid',
+        'mobile', 'phone', 'tel', 'contact', 'email', 'website', 'fax'
     ]
 
     def is_valid_name_candidate(text: str) -> bool:
