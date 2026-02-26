@@ -609,6 +609,8 @@ from extractors import (
     extract_pan,
     extract_voter,
     extract_passport,
+    is_kyc_report,
+    extract_kyc_report,
     split_address,
 )
 
@@ -694,7 +696,19 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
     records = ocr_records_from_image(img, doc_type)
     lines = [r['text'] for r in records]
     text = "\n".join(lines)
-    
+
+    # KYC Report bypass — detect and extract before standard validation
+    if doc_type == 'aadhaar' and is_kyc_report(lines, text):
+        extracted = extract_kyc_report(lines, text, records)
+        response = create_uniform_response(doc_type, extracted, records)
+        address_split = split_address(response["address"]["value"])
+        response["additionalDetails"] = {
+            "faceDetected": False,
+            "faceImage": "",
+            "addressSplit": address_split,
+        }
+        return response
+
     # Validate document type
     is_valid_document = validate_document_type(doc_type, lines, text)
 
@@ -703,10 +717,36 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
             status_code=400,
             detail="Invalid Document"
         )
-    
+
+    # For Aadhaar back side: crop left column to remove bilingual overlap
+    # The back side has English (left) and Hindi (right) in parallel columns.
+    # OCR merges both columns at the same y-position, creating garbage text.
+    # Cropping isolates the English column for clean extraction.
+    aadhaar_back_full_text = None
+    aadhaar_back_full_lines = None
+    if doc_type == 'aadhaar':
+        from extractors.aadhaar import is_aadhaar_back_side
+        if is_aadhaar_back_side(lines, text):
+            # Save full-image data for Aadhaar number fallback
+            aadhaar_back_full_text = text
+            aadhaar_back_full_lines = lines[:]
+            # Crop left ~52% of image to get English-only text
+            w, h = img.size
+            left_img = img.crop((0, 0, int(w * 0.52), h))
+            records = ocr_records_from_image(left_img, doc_type)
+            lines = [r['text'] for r in records]
+            text = "\n".join(lines)
+
     # Extract based on document type
     if doc_type == 'aadhaar':
         extracted = extract_aadhaar(lines, text, records)
+        # Fallback: if back side and Aadhaar number not found in cropped image,
+        # use the number from the full image (the crop may cut the centered number)
+        if aadhaar_back_full_text and not extracted.get('aadhaar_number'):
+            from extractors.aadhaar import extract_aadhaar_number
+            extracted['aadhaar_number'] = extract_aadhaar_number(
+                aadhaar_back_full_text, aadhaar_back_full_lines
+            )
     elif doc_type == 'pan':
         extracted = extract_pan(lines, text, records)
     elif doc_type == 'driving_license':

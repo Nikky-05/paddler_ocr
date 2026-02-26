@@ -20,8 +20,131 @@ from .utils import (
 )
 
 
+def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
+    """Detect if the image is the back side of an Aadhaar card.
+
+    Back side characteristics:
+    - Has "Address:" label or Hindi "पत्ता" label
+    - Does NOT have DOB or gender (front side only fields)
+    - Typically has bilingual text (English + Hindi/regional language) in two columns
+    """
+    # Back side indicators
+    has_address_label = bool(
+        re.search(r'\bAddress\s*:', text, re.I) or 'पत्ता' in text
+    )
+
+    # Front side indicators (should be absent on back)
+    has_dob = bool(re.search(
+        r'\bDOB\b|जन्म\s*तिथि|Year\s*of\s*Birth|Date\s*of\s*Birth',
+        text, re.I
+    ))
+    has_gender = bool(re.search(
+        r'\b(MALE|FEMALE|TRANSGENDER)\b|पुरुष|महिला',
+        text, re.I
+    ))
+
+    # Back side: has address label but no DOB and no gender
+    if has_address_label and not has_dob and not has_gender:
+        print("[DEBUG] Detected Aadhaar BACK side")
+        return True
+
+    return False
+
+
+def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Dict:
+    """Extract data from Aadhaar card back side.
+
+    Back side contains:
+    - Address (in English + regional language)
+    - Aadhaar number
+    - Optionally VID
+
+    Does NOT contain:
+    - Name, DOB, Gender (these are on front side only)
+    """
+    obj = {
+        "name": "",
+        "gender": "",
+        "dob": "",
+        "aadhaar_number": "",
+        "address": "",
+        "vid": "",
+        "father_name": "",
+        "mother_name": "",
+        "husband_name": "",
+        "nationality": ""
+    }
+
+    print("\n[DEBUG] ===== Aadhaar BACK Side Extraction Started =====")
+    print(f"[DEBUG] Total OCR lines: {len(lines)}")
+    print("[DEBUG] OCR Lines:")
+    for i, ln in enumerate(lines[:20]):
+        print(f"[DEBUG]   Line {i}: '{ln}'")
+
+    # Extract Aadhaar number (same logic as front side)
+    obj['aadhaar_number'] = extract_aadhaar_number(text, lines)
+    print(f"[DEBUG] Aadhaar Number: {obj['aadhaar_number']}")
+
+    # Extract VID
+    obj['vid'] = extract_vid(text, lines)
+    print(f"[DEBUG] VID: {obj['vid']}")
+
+    # Extract address (use existing logic - works well with clean left-column text)
+    obj['address'] = extract_address(lines, "")
+    print(f"[DEBUG] Address: {obj['address'][:100]}..." if len(obj['address']) > 100 else f"[DEBUG] Address: {obj['address']}")
+
+    # Extract relation names from S/O, D/O, W/O, C/O markers in address lines
+    for ln in lines:
+        # Match S/O (father), D/O (father), W/O (husband), C/O (father)
+        rel_match = re.search(
+            r'\b(S/O|D/O|C/O|SON\s*OF|DAUGHTER\s*OF|CARE\s*OF)\s*:?\s*(.+)',
+            ln, re.I
+        )
+        if rel_match:
+            raw_name = rel_match.group(2).strip()
+            # Remove everything after first comma (address portion)
+            raw_name = re.sub(r'[,\.].*$', '', raw_name).strip()
+            raw_name = extract_english_only(raw_name)
+            raw_name = clean_ocr_garbage(raw_name)
+            if raw_name and len(raw_name) > 2 and re.match(r'^[A-Za-z\s]+$', raw_name):
+                obj['father_name'] = raw_name
+                break
+
+        husband_match = re.search(
+            r'\b(W/O|WIFE\s*OF)\s*:?\s*(.+)', ln, re.I
+        )
+        if husband_match:
+            raw_name = husband_match.group(2).strip()
+            raw_name = re.sub(r'[,\.].*$', '', raw_name).strip()
+            raw_name = extract_english_only(raw_name)
+            raw_name = clean_ocr_garbage(raw_name)
+            if raw_name and len(raw_name) > 2 and re.match(r'^[A-Za-z\s]+$', raw_name):
+                obj['husband_name'] = raw_name
+                break
+
+    print(f"[DEBUG] Father: {obj['father_name']}")
+    print(f"[DEBUG] Mother: {obj['mother_name']}")
+    print(f"[DEBUG] Husband: {obj['husband_name']}")
+
+    # Nationality
+    if re.search(r'(GOVERNMENT OF INDIA|भारत सरकार|REPUBLIC OF INDIA|Unique Identification)', text, re.I):
+        obj['nationality'] = 'INDIAN'
+
+    print("\n[DEBUG] ===== Back Side Extraction Results =====")
+    for key, val in obj.items():
+        print(f"[DEBUG]   {key}: '{val}'")
+    print("[DEBUG] =========================================\n")
+
+    return obj
+
+
 def extract_aadhaar(lines: List[str], text: str, records: List[Dict]) -> Dict:
     """Extract data from Aadhaar card - handles all Indian Aadhaar formats."""
+
+    # Check if this is the back side of an Aadhaar card
+    if is_aadhaar_back_side(lines, text):
+        return extract_aadhaar_back(lines, text, records)
+
     obj = {
         "name": "",
         "gender": "",
@@ -294,7 +417,7 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
     1. Hindi name (Devanagari) followed by English name on next line
     2. Name appears after "To" in e-Aadhaar
     3. Name appears before DOB/Gender lines
-    4. ALL CAPS names like "PAYAL LAXMAN BISANE"
+    4. ALL CAPS names like "NIKKY LAXMAN BISEN"
     """
 
     # Build list of boilerplate/institutional text to skip

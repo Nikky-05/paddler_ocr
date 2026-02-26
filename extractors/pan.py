@@ -86,6 +86,74 @@ def _get_name_candidates(lines: List[str], conf_map: Dict[str, float] = None) ->
     return candidates
 
 
+def _is_garbage_pan_name(name: str) -> bool:
+    """Stricter per-word check to detect OCR garbage that passes basic validation.
+
+    Hindi labels like "नाम" OCR'd with an English model produce garbage such as
+    "HRCOR TERCOR".  These pass the overall vowel ratio check (30%) but contain
+    impossible consonant clusters at the word level (e.g. "HRC" start).
+
+    Rules checked per word:
+    - Word must contain at least one vowel (A E I O U)
+    - Word must not START with 3+ consonants unless it is a well-known cluster
+      (SHR, STR, SPR, SCR, CHR, THR — common in Indian names like SHRUTI)
+    """
+    if not name:
+        return False
+
+    # Well-known 3-consonant starts found in real Indian names
+    _ALLOWED_3 = ('SHR', 'STR', 'SPR', 'SCR', 'CHR', 'THR')
+    _CONSONANTS = 'BCDFGHJKLMNPQRSTVWXYZ'
+
+    for word in name.strip().split():
+        w = word.upper().strip('.')
+        if len(w) < 2:
+            continue
+
+        # No vowels at all → garbage (real names always have vowels)
+        if not any(c in 'AEIOU' for c in w):
+            return True
+
+        # Starts with 3+ consonants that aren't a known cluster
+        m = re.match(r'^([' + _CONSONANTS + r']+)', w)
+        if m and len(m.group(1)) >= 3:
+            if not m.group(1).startswith(_ALLOWED_3):
+                return True
+
+    return False
+
+
+def _fix_garbage_pan_names(obj: Dict, lines: List[str], conf_map: Dict) -> None:
+    """Post-processing: replace garbage names with clean candidates.
+
+    If the extracted name or father_name looks like OCR garbage, find better
+    candidates from the OCR lines.  Also fixes the case where the real person
+    name was wrongly assigned to father_name.
+    """
+    name_dirty = obj.get('name', '') and _is_garbage_pan_name(obj['name'])
+    father_dirty = obj.get('father_name', '') and _is_garbage_pan_name(obj['father_name'])
+
+    if not name_dirty and not father_dirty:
+        return  # nothing to fix
+
+    # Collect clean candidates (reuses existing helper)
+    all_candidates = _get_name_candidates(lines, conf_map)
+    clean = [c for c in all_candidates if not _is_garbage_pan_name(c)]
+
+    if name_dirty:
+        obj['name'] = clean[0] if clean else ''
+
+    if father_dirty:
+        others = [c for c in clean if c != obj['name']]
+        obj['father_name'] = others[0] if others else ''
+
+    # If name and father ended up the same (e.g. father was the real name),
+    # reassign father to the next available clean candidate
+    if obj['name'] and obj['father_name'] and obj['name'].upper() == obj['father_name'].upper():
+        others = [c for c in clean if c.upper() != obj['name'].upper()]
+        obj['father_name'] = others[0] if others else ''
+
+
 def extract_pan(lines: List[str], text: str, records: List[Dict] = None) -> Dict:
     """Extract data from PAN card."""
     obj = {
@@ -169,5 +237,11 @@ def extract_pan(lines: List[str], text: str, records: List[Dict] = None) -> Dict
                 if c != obj['name']:
                     obj['father_name'] = c
                     break
+
+    # --- Post-processing: detect and replace garbage names ---
+    # Hindi labels (e.g. "नाम") OCR'd with English model produce garbage like
+    # "HRCOR TERCOR" that passes basic validation but has impossible consonant
+    # clusters.  Detect these and replace with clean candidates.
+    _fix_garbage_pan_names(obj, lines, conf_map)
 
     return obj
