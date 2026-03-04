@@ -16,7 +16,7 @@ from .utils import (
     clean_ocr_garbage, is_valid_name, looks_like_address,
     contains_devanagari, is_title_case_name, is_uidai_boilerplate,
     looks_like_uidai_text, is_likely_garbage, has_reasonable_vowel_ratio,
-    extract_english_only
+    extract_english_only, validate_verhoeff
 )
 
 
@@ -93,41 +93,18 @@ def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Di
     obj['address'] = extract_address(lines, "")
     print(f"[DEBUG] Address: {obj['address'][:100]}..." if len(obj['address']) > 100 else f"[DEBUG] Address: {obj['address']}")
 
-    # Extract relation names from S/O, D/O, W/O, C/O markers in address lines
-    for ln in lines:
-        # Match S/O (father), D/O (father), W/O (husband), C/O (father)
-        rel_match = re.search(
-            r'\b(S/O|D/O|C/O|SON\s*OF|DAUGHTER\s*OF|CARE\s*OF)\s*:?\s*(.+)',
-            ln, re.I
-        )
-        if rel_match:
-            raw_name = rel_match.group(2).strip()
-            # Remove everything after first comma (address portion)
-            raw_name = re.sub(r'[,\.].*$', '', raw_name).strip()
-            raw_name = extract_english_only(raw_name)
-            raw_name = clean_ocr_garbage(raw_name)
-            if raw_name and len(raw_name) > 2 and re.match(r'^[A-Za-z\s]+$', raw_name):
-                obj['father_name'] = raw_name
-                break
-
-        husband_match = re.search(
-            r'\b(W/O|WIFE\s*OF)\s*:?\s*(.+)', ln, re.I
-        )
-        if husband_match:
-            raw_name = husband_match.group(2).strip()
-            raw_name = re.sub(r'[,\.].*$', '', raw_name).strip()
-            raw_name = extract_english_only(raw_name)
-            raw_name = clean_ocr_garbage(raw_name)
-            if raw_name and len(raw_name) > 2 and re.match(r'^[A-Za-z\s]+$', raw_name):
-                obj['husband_name'] = raw_name
-                break
+    # Extract relation names (father/husband/mother) using shared logic
+    father, mother, husband = extract_relation_names(lines, "")
+    obj['father_name'] = father
+    obj['mother_name'] = mother
+    obj['husband_name'] = husband
 
     print(f"[DEBUG] Father: {obj['father_name']}")
     print(f"[DEBUG] Mother: {obj['mother_name']}")
     print(f"[DEBUG] Husband: {obj['husband_name']}")
 
-    # Nationality
-    if re.search(r'(GOVERNMENT OF INDIA|भारत सरकार|REPUBLIC OF INDIA|Unique Identification)', text, re.I):
+    # Nationality - expanded detection
+    if re.search(r'(GOVERNMENT OF INDIA|भारत सरकार|REPUBLIC OF INDIA|Unique Identification|UIDAI|Aadhar|Aadhaar)', text, re.I):
         obj['nationality'] = 'INDIAN'
 
     print("\n[DEBUG] ===== Back Side Extraction Results =====")
@@ -223,7 +200,7 @@ def extract_aadhaar(lines: List[str], text: str, records: List[Dict]) -> Dict:
     # =========================================================================
     # STEP 8: Extract Nationality
     # =========================================================================
-    if re.search(r'(GOVERNMENT OF INDIA|भारत सरकार|REPUBLIC OF INDIA)', text, re.I):
+    if re.search(r'(GOVERNMENT OF INDIA|भारत सरकार|REPUBLIC OF INDIA|Unique Identification|UIDAI|Aadhar|Aadhaar)', text, re.I):
         obj['nationality'] = 'INDIAN'
 
     print("\n[DEBUG] ===== Final Extraction Results =====")
@@ -235,37 +212,60 @@ def extract_aadhaar(lines: List[str], text: str, records: List[Dict]) -> Dict:
 
 
 def extract_aadhaar_number(text: str, lines: List[str]) -> str:
-    """Extract 12-digit Aadhaar number."""
+    """Extract 12-digit Aadhaar number with Verhoeff validation."""
 
-    # Pattern 1: Spaced format "1234 5678 9012" (most common)
-    match = re.search(r'\b(\d{4}\s+\d{4}\s+\d{4})\b', text)
-    if match:
-        return re.sub(r'\s+', '', match.group(1))
+    candidates = []
+
+    # Pattern 1: Spaced format "1234 5678 9012"
+    # Find all occurrences to handle duplicates or merged OCR noise
+    spaced_matches = re.finditer(r'\b(\d{4}\s+\d{4}\s+\d{4})\b', text)
+    for m in spaced_matches:
+        num = re.sub(r'\s+', '', m.group(1))
+        if validate_verhoeff(num):
+            candidates.append(num)
 
     # Pattern 2: After "Aadhaar No" label
-    match = re.search(r'Aadhaar\s*No\.?\s*:?\s*(\d{4}\s*\d{4}\s*\d{4})', text, re.I)
-    if match:
-        return re.sub(r'\s+', '', match.group(1))
+    label_matches = re.finditer(r'Aadhaar\s*No\.?\s*:?\s*(\d{4}\s*\d{4}\s*\d{4})', text, re.I)
+    for m in label_matches:
+        num = re.sub(r'\s+', '', m.group(1))
+        if validate_verhoeff(num):
+            candidates.append(num)
 
     # Pattern 3: Continuous 12 digits
     for ln in lines:
-        match = re.search(r'\b(\d{12})\b', ln)
-        if match:
-            # Verify it's not part of a longer number (like VID or phone)
-            num = match.group(1)
+        for m in re.finditer(r'\b(\d{12})\b', ln):
+            num = m.group(1)
             # Check context - shouldn't have more digits around
             full_match = re.search(r'\d{12,}', ln)
             if full_match and len(full_match.group(0)) == 12:
-                return num
+                if validate_verhoeff(num):
+                    candidates.append(num)
 
-    # Pattern 4: 4+4+4 with any separator
+    # Pattern 4: 4+4+4 with any small separator (fallback for messy OCR)
+    # Search for local sequences only, NOT global concatenation
+    merged_matches = re.finditer(r'\b(\d{4})[^\d\n]{0,2}(\d{4})[^\d\n]{0,2}(\d{4})\b', text)
+    for m in merged_matches:
+        num = m.group(1) + m.group(2) + m.group(3)
+        if validate_verhoeff(num):
+            candidates.append(num)
+
+    # Pattern 5: Continuous 12 digits regardless of boundaries (last resort)
+    for m in re.finditer(r'\d{12}', text):
+        num = m.group(0)
+        if validate_verhoeff(num):
+            candidates.append(num)
+
+    # Return the most frequent valid candidate or the last one found
+    if candidates:
+        from collections import Counter
+        most_common = Counter(candidates).most_common(1)
+        return most_common[0][0]
+
+    # Fallback to Pattern 4 original regex if no Verhoeff match found (to keep behavior consistent)
     match = re.search(r'(\d{4})[^\d\n]{0,3}(\d{4})[^\d\n]{0,3}(\d{4})(?!\d)', text)
     if match:
         candidate = match.group(1) + match.group(2) + match.group(3)
-        # Verify not part of VID (check no more digits follow)
-        end_pos = match.end()
-        if end_pos < len(text) and not text[end_pos:end_pos+5].strip().startswith(('0','1','2','3','4','5','6','7','8','9')):
-            return candidate
+        return candidate
 
     return ""
 
@@ -668,16 +668,25 @@ def extract_relation_names(lines: List[str], person_name: str) -> Tuple[str, str
 
     def extract_name_after_marker(line: str, marker_pattern: str) -> str:
         """Extract name after a relation marker."""
-        match = re.search(marker_pattern + r'\s*:?\s*(.+)', line, re.I)
+        # More flexible marker matching for S/O, S:O, S.O etc.
+        # Handle cases where S/O is separated by spaces
+        flexible_marker = marker_pattern.replace('/', r'\s*[\/:]\s*')
+        match = re.search(flexible_marker + r'[:\-]?\s*([A-Za-z\.\-\s]+)', line, re.I)
         if match:
             name = match.group(1).strip()
-            # Clean up
-            name = re.sub(r'[,\.].*$', '', name)  # Remove everything after comma/period
+            # If name followed by address without comma, check for common address keywords
+            # Use case-insensitive regex split for robust extraction
+            addr_keywords = r'\b(House|Flat|Ward|Nagar|Village|Road|Street|Sector|Plot|Behind|Opposite|Near)\b'
+            parts = re.split(addr_keywords, name, flags=re.I)
+            name = parts[0].strip()
+            
             name = extract_english_only(name)
             name = clean_ocr_garbage(name)
 
-            if name and len(name) > 2 and re.match(r'^[A-Za-z\s]+$', name):
-                return name
+            if name and len(name) > 2:
+                # Allow dots and hyphens in names
+                if re.match(r'^[A-Za-z\.\-\s]+$', name):
+                    return name
         return ""
 
     def looks_like_address(text: str) -> bool:
@@ -738,6 +747,47 @@ def extract_relation_names(lines: List[str], person_name: str) -> Tuple[str, str
     return father, mother, husband
 
 
+def _clean_and_deduplicate_address(address_parts: List[str], person_name: str = "") -> str:
+    """Helper to deduplicate and clean address parts, handling merged column artifacts."""
+    if not address_parts:
+        return ""
+        
+    unique_parts = []
+    seen = set()
+    for p in address_parts:
+        # Skip if part of person name
+        if person_name and p.upper() == person_name.upper():
+            continue
+            
+        # Skip if it contains a relation marker (already extracted separately)
+        if re.search(r'\b(S/O|D/O|W/O|C/O)\b', p, re.I):
+            continue
+        
+        p_clean = p.lower().strip()
+        # Remove non-alphanumeric for comparison
+        comp_key = re.sub(r'[^a-z0-9]', '', p_clean)
+        
+        if comp_key and comp_key not in seen:
+            # Check for near-duplicates (one part contained in another)
+            # Common when horizontal OCR merges English and Marathi columns
+            is_duplicate = False
+            for seen_key in seen:
+                if len(comp_key) > 5 and len(seen_key) > 5:
+                    if comp_key in seen_key or seen_key in comp_key:
+                        is_duplicate = True
+                        break
+            
+            if not is_duplicate:
+                unique_parts.append(p)
+                seen.add(comp_key)
+    
+    addr = ', '.join(unique_parts)
+    # Final cleanup
+    addr = re.sub(r',\s*,', ',', addr)
+    addr = re.sub(r'\s+', ' ', addr)
+    return addr.strip().strip(',')
+
+
 def extract_address(lines: List[str], person_name: str) -> str:
     """Extract address from Aadhaar card."""
 
@@ -745,7 +795,8 @@ def extract_address(lines: List[str], person_name: str) -> str:
     collecting = False
 
     # Address indicators
-    address_start = r'\b(S/O|D/O|W/O|C/O|Address|पता|HOUSE|FLAT|VILLAGE|VTC|PO:|POST)\b'
+    # Address indicators - ensure D/O doesn't match D/O/B
+    address_start = r'\b(S/O|D/O(?!\/B)|W/O|C/O|Address|पता|HOUSE|FLAT|VILLAGE|VTC|PO:|POST)\b'
     address_end_indicators = [
         r'\b\d{6}\b',  # PIN code
     ]
@@ -757,6 +808,10 @@ def extract_address(lines: List[str], person_name: str) -> str:
         r'signature',
         r'help@',
         r'www\.',
+        r'\bDOB\b',
+        r'Date of Birth',
+        r'\b(MALE|FEMALE|TRANSGENDER)\b',
+        r'(/|\b)(MALE|FEMALE)\b',
     ]
 
     # Strategy 1: Find "Address:" label
@@ -770,12 +825,22 @@ def extract_address(lines: List[str], person_name: str) -> str:
             continue
 
         if collecting:
-            # Skip unwanted lines
-            if any(re.search(p, ln, re.I) for p in skip_patterns):
+            # 1. Skip lines that are purely boilerplate
+            pure_skip = [r'signature', r'help@', r'www\.', r'Aadhaar\s*No', r'VID\s*:']
+            if any(re.search(p, ln, re.I) for p in pure_skip):
                 continue
 
-            # Add this line
-            clean_ln = extract_english_only(ln).strip()
+            # 2. Clean merged boilerplate from line instead of skipping
+            # (Essential for e-Aadhaar where columns merge)
+            clean_ln = ln
+            for p in [r'Date of Birth', r'\bDOB\b', r'\d{2}/\d{2}/\d{4}', r'\b(MALE|FEMALE|TRANSGENDER)\b', r'(/|\b)(MALE|FEMALE)\b']:
+                clean_ln = re.sub(p, '', clean_ln, flags=re.I).strip()
+            
+            # 3. Final cleaning of individual line
+            clean_ln = extract_english_only(clean_ln).strip()
+            # Remove leading/trailing symbols that might remain after cleaning
+            clean_ln = re.sub(r'^[:\-,\.\s]+|[:\-,\.\s]+$', '', clean_ln).strip()
+            
             if clean_ln:
                 address_parts.append(clean_ln)
 
@@ -784,7 +849,7 @@ def extract_address(lines: List[str], person_name: str) -> str:
                 break
 
     if address_parts:
-        return ', '.join(address_parts)
+        return _clean_and_deduplicate_address(address_parts, person_name)
 
     # Strategy 2: Start from "To" block (e-Aadhaar format)
     # Pattern: "To\n[Hindi name]\n[English name]\n[Address lines...]\n[PIN]"
@@ -805,43 +870,40 @@ def extract_address(lines: List[str], person_name: str) -> str:
                 if contains_devanagari(line_j) and not extract_english_only(line_j).strip():
                     continue
 
-                clean_ln = extract_english_only(line_j).strip()
-                if not clean_ln:
+                # Initial cleaning of individual line
+                clean_line = extract_english_only(line_j).strip()
+                if not clean_line:
                     continue
 
-                # Skip the person's English name
-                if person_name and clean_ln.upper() == person_name.upper():
+                # Skip the person's name if seen right after "To"
+                if person_name and clean_line.upper() == person_name.upper():
                     name_found = True
                     continue
-
-                # Once we've passed the name, remaining lines are address
+                
+                # Check for likely name pattern if name_found is False
                 if not name_found:
-                    # This line might be the name itself if not yet matched
-                    # Check if it's a likely name (ALL CAPS, 2-4 words, no digits, no address keywords)
-                    words = clean_ln.split()
-                    is_name_like = (
-                        len(words) >= 2 and len(words) <= 4
-                        and all(w.isalpha() for w in words)
-                        and not looks_like_address(clean_ln)
-                        and has_reasonable_vowel_ratio(clean_ln)
-                    )
-                    if is_name_like and not address_parts:
+                    words = clean_line.split()
+                    if 2 <= len(words) <= 4 and all(w.isalpha() for w in words) and not looks_like_address(clean_line) and has_reasonable_vowel_ratio(clean_line):
                         name_found = True
                         continue
 
-                # Collect as address
-                address_parts.append(clean_ln)
+                # Clean merged boilerplate from line
+                # (Essential for e-Aadhaar where columns merge)
+                for p in [r'Date of Birth', r'\bDOB\b', r'\d{2}/\d{2}/\d{4}', r'\b(MALE|FEMALE|TRANSGENDER)\b', r'(/|\b)(MALE|FEMALE)\b']:
+                    clean_line = re.sub(p, '', clean_line, flags=re.I).strip()
+                
+                # Final strip of symbols
+                clean_line = re.sub(r'^[:\-,\.\s]+|[:\-,\.\s]+$', '', clean_line).strip()
+
+                if clean_line:
+                    address_parts.append(clean_line)
 
                 # Stop at PIN code
                 if re.search(r'\b\d{6}\b', line_j):
                     break
 
             if address_parts:
-                addr = ', '.join(address_parts)
-                addr = re.sub(r',\s*,', ',', addr)
-                addr = re.sub(r'\s+', ' ', addr)
-                print(f"[DEBUG] Found address via 'To' block: '{addr}'")
-                return addr.strip()
+                return _clean_and_deduplicate_address(address_parts, person_name)
 
     # Strategy 3: Start from relation marker (S/O, D/O, etc.)
     for i, ln in enumerate(lines):
@@ -850,18 +912,26 @@ def extract_address(lines: List[str], person_name: str) -> str:
             continue
 
         if collecting:
-            if any(re.search(p, ln, re.I) for p in skip_patterns):
+            # Skip boilerplate-only lines
+            if any(re.search(p, ln, re.I) for p in [r'signature', r'help@', r'www\.', r'Aadhaar\s*No', r'VID\s*:']):
                 continue
 
-            clean_ln = extract_english_only(ln).strip()
-            if clean_ln and not (person_name and clean_ln == person_name):
-                address_parts.append(clean_ln)
+            # Clean merged boilerplate from line
+            clean_line = ln
+            for p in [r'Date of Birth', r'\bDOB\b', r'\d{2}/\d{2}/\d{4}', r'\b(MALE|FEMALE|TRANSGENDER)\b', r'(/|\b)(MALE|FEMALE)\b']:
+                clean_line = re.sub(p, '', clean_line, flags=re.I).strip()
+            
+            clean_line = extract_english_only(clean_line).strip()
+            clean_line = re.sub(r'^[:\-,\.\s]+|[:\-,\.\s]+$', '', clean_line).strip()
+            
+            if clean_line and not (person_name and clean_line.upper() == person_name.upper()):
+                address_parts.append(clean_line)
 
             if re.search(r'\b\d{6}\b', ln):
                 break
 
     if address_parts:
-        return ', '.join(address_parts)
+        return _clean_and_deduplicate_address(address_parts, person_name)
 
     # Strategy 4: Find lines with address keywords
     for i, ln in enumerate(lines):
@@ -879,10 +949,6 @@ def extract_address(lines: List[str], person_name: str) -> str:
             break
 
     if address_parts:
-        addr = ', '.join(address_parts)
-        # Clean up duplicate commas and spaces
-        addr = re.sub(r',\s*,', ',', addr)
-        addr = re.sub(r'\s+', ' ', addr)
-        return addr.strip()
+        return _clean_and_deduplicate_address(address_parts, person_name)
 
     return ""

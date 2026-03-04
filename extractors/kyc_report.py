@@ -29,9 +29,9 @@ _MONTHS = {
     'october': '10', 'november': '11', 'december': '12',
 }
 
-# All known table label patterns — used to check if a line is "just a label"
+# All known table label patterns — used to check if a line is or starts with a label
 _ALL_LABEL_RE = re.compile(
-    r'^(?:id\s*number|name|dob|father\s*name|gender|pincode|address)\s*:?\s*$',
+    r'^(?:id\s*number|name|dob|father\s*name|gender|pincode|address)\b',
     re.I,
 )
 
@@ -96,7 +96,7 @@ def _convert_kyc_dob(dob_str: str) -> str:
 
     # Already in DD/MM/YYYY or DD-MM-YYYY format
     if re.match(r'^\d{2}[/\-]\d{2}[/\-]\d{4}$', dob_str):
-        return dob_str.replace('-', '/')
+        return "".replace('-', '/')
 
     # Pattern: "1st Jan 1995" or "23rd February 2000"
     match = re.match(
@@ -115,24 +115,54 @@ def _convert_kyc_dob(dob_str: str) -> str:
     return dob_str
 
 
-def _find_value_after_label(lines: List[str], label_idx: int, label_end_col: int,
-                            label_line_text: str) -> Optional[str]:
-    """Get value for a label: same-line remainder first, else next non-label line."""
-    remainder = label_line_text[label_end_col:].strip().lstrip(':').strip()
-    if remainder:
-        return remainder
+def _clean_val(s: Optional[str]) -> str:
+    """Clean OCR value: strip colons, pipes, and whitespace."""
+    if not s:
+        return ""
+    # Strip leading/trailing pipes, colons, dots, and spaces
+    s = s.strip().strip('|').strip(':').strip('.').strip()
+    # Normalize internal spaces
+    s = re.sub(r'\s+', ' ', s)
+    return s
 
-    # Try next lines, skipping lines that are themselves bare labels
-    for j in range(label_idx + 1, min(label_idx + 3, len(lines))):
-        candidate = lines[j].strip()
-        if not candidate:
-            continue
-        if _ALL_LABEL_RE.match(candidate):
-            # Next line is just another label — value is missing
-            return None
-        return candidate
 
-    return None
+def _find_value_in_lines(lines: List[str], label_pattern: str, skip_father_for_name: bool = False) -> str:
+    """Search for a label and return its value (same line or next)."""
+    for i, ln in enumerate(lines):
+        ln_s = ln.strip()
+        # Strategy A: Label and Value on same line
+        # Use non-greedy match for label to handle merged borders
+        m = re.search(f'[\\s|]*({label_pattern})[\\s:|]+(.+)', ln_s, re.I)
+        if not m:
+             # Try without mandatory space for merged OCR (e.g. Dob1st)
+             m = re.search(f'[\\s|]*({label_pattern})[\\s:|]*(.+)', ln_s, re.I)
+        
+        if m:
+            label_part = m.group(1).lower()
+            val = m.group(2).strip()
+            if skip_father_for_name and 'father' in label_part:
+                continue
+            # If value is just another label keyword, it's not the value
+            if re.match(r'^(?:name|dob|father|gender|pincode|address|id)\b', val, re.I):
+                continue
+            return _clean_val(val)
+
+        # Strategy B: Label alone, value on next line (Strategy B) or previous line (Strategy C)
+        if re.search(f'^[\s|]*{label_pattern}[\s:|]*$', ln_s, re.I):
+            if skip_father_for_name and 'father' in ln_s.lower():
+                continue
+            # Try next line (Strategy B)
+            if i + 1 < len(lines):
+                val = lines[i + 1].strip()
+                if not re.match(r'^(?:name|dob|father|gender|pincode|address|id|xml|aadhaar)\b', val, re.I):
+                    return _clean_val(val)
+            # Try previous line (Strategy C - common in some table OCRs)
+            if i - 1 >= 0:
+                val = lines[i - 1].strip()
+                # Must look like data, not another label or section header
+                if not re.match(r'^(?:name|dob|father|gender|pincode|address|id|xml|aadhaar|kyc|customer|kid)\b', val, re.I):
+                    return _clean_val(val)
+    return ""
 
 
 def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict:
@@ -170,285 +200,181 @@ def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict
     # ===================================================================
     # 1. AADHAAR NUMBER — masked pattern like *********3699
     # ===================================================================
+    # For Aadhaar, prioritize the masked pattern search to avoid cross-field errors
     m = re.search(r'(\*{4,}\d{4})', text)
     if m:
         obj['aadhaar_number'] = m.group(1)
-        print(f"[DEBUG] Aadhaar (masked): {obj['aadhaar_number']}")
+    
+    if not obj['aadhaar_number']:
+        obj['aadhaar_number'] = _find_value_in_lines(lines, r'Id\s*number')
 
     # ===================================================================
-    # 2. NAME — try multiple strategies
+    # 2. NAME
     # ===================================================================
-    # Strategy A: "Customer Name: XXX" in header (very reliable)
-    m = re.search(r'Customer\s*Name\s*:\s*(.+)', text, re.I)
+    # Strategy A: "Customer Name: XXX" in header 
+    m = re.search(r'Customer\s*Name\s*[:\s|]+(.*?)(?:\s+(?:Date|Customer|KID|Identification):|$)', text, re.I)
     if m:
-        obj['name'] = m.group(1).strip()
-        print(f"[DEBUG] Name (from header): {obj['name']}")
+        obj['name'] = _clean_val(m.group(1))
 
-    # Strategy B: table "Name <value>" on same line (but NOT "Father Name")
+    # Strategy B: table scan
+    if not obj['name']:
+        obj['name'] = _find_value_in_lines(lines, r'(?<!Father\s)Name', skip_father_for_name=True)
+
+    # Strategy C: merged Name line fallback (e.g. Line 14: "number Md Furqan")
     if not obj['name']:
         for ln in lines:
-            # Match "Name Md Furqan" but not "Father Name Md Irfan"
-            m = re.match(r'^(?<!Father\s)Name\s+(.+)', ln.strip(), re.I)
-            if m:
-                val = m.group(1).strip()
-                # Reject if value starts with another label keyword
-                if not re.match(r'^(?:dob|father|gender|pincode|address|id)\b', val, re.I):
-                    obj['name'] = val
-                    print(f"[DEBUG] Name (same-line): {obj['name']}")
-                    break
-        # Also try: line starts with "Name" exactly, not preceded by "Father" on the
-        # same line — need to check the full line doesn't contain "Father"
-        if not obj['name']:
-            for i, ln in enumerate(lines):
-                ln_s = ln.strip()
-                if re.match(r'^Name\s*$', ln_s, re.I) and 'father' not in ln_s.lower():
-                    val = _find_value_after_label(lines, i, len(ln_s), ln_s)
-                    if val and not re.match(r'^(?:dob|father|gender|pincode|address|id)\b', val, re.I):
-                        obj['name'] = val
-                        print(f"[DEBUG] Name (next-line): {obj['name']}")
+            if 'number' in ln.lower() and re.search(r'[A-Z][a-z]+', ln):
+                m = re.search(r'number\s+(.*)', ln, re.I)
+                if m:
+                    candidate = _clean_val(m.group(1))
+                    if not re.match(r'^(?:dob|father|gender|pincode|address|id)\b', candidate, re.I):
+                        obj['name'] = candidate
                         break
 
     # ===================================================================
-    # 3. DOB — date patterns
+    # 3. DOB
     # ===================================================================
-    # Strategy A: "Dob <value>" on same line
-    for ln in lines:
-        m = re.match(r'^Dob\s+(.+)', ln.strip(), re.I)
-        if m:
-            obj['dob'] = _convert_kyc_dob(m.group(1).strip())
-            print(f"[DEBUG] DOB (same-line): {obj['dob']}")
-            break
-
-    # Strategy B: "Dob" alone, value on next line
-    if not obj['dob']:
-        for i, ln in enumerate(lines):
-            if re.match(r'^Dob\s*$', ln.strip(), re.I):
-                val = _find_value_after_label(lines, i, len(ln.strip()), ln.strip())
-                if val:
-                    obj['dob'] = _convert_kyc_dob(val)
-                    print(f"[DEBUG] DOB (next-line): {obj['dob']}")
-                    break
-
-    # Strategy C: search full text for date-like pattern near "Dob" keyword
+    # Strategy A: Find in table
+    dob_val = _find_value_in_lines(lines, r'Dob')
+    if not dob_val:
+        # Strategy B: Flexible search on lines since Dob can be merged with labels
+        for ln in lines:
+            m = re.search(r'\bDob\s*[:\s|]*(\d{1,2}\s*(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})', ln, re.I)
+            if m:
+                dob_val = m.group(1).strip()
+                break
+    
+    if dob_val:
+        obj['dob'] = _convert_kyc_dob(dob_val)
+    
+    # Strategy C: Global text search
     if not obj['dob']:
         m = re.search(r'\bDob\s*[:\s]*(\d{1,2}\s*(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})', text_norm, re.I)
         if m:
             obj['dob'] = _convert_kyc_dob(m.group(1).strip())
-            print(f"[DEBUG] DOB (text search): {obj['dob']}")
 
     # ===================================================================
     # 4. FATHER NAME
     # ===================================================================
-    # Strategy A: "Father Name <value>" on same line
-    for ln in lines:
-        m = re.match(r'^Father\s*Name\s+(.+)', ln.strip(), re.I)
-        if m:
-            val = m.group(1).strip()
-            if not re.match(r'^(?:dob|gender|pincode|address|id)\b', val, re.I):
-                obj['father_name'] = val
-                print(f"[DEBUG] Father (same-line): {obj['father_name']}")
-                break
+    # Strategy A: Table scan (same line, next line, or previous line)
+    obj['father_name'] = _find_value_in_lines(lines, r'Father(?:\s*Name)?')
+    if obj['father_name']:
+        # Cleanup: sometimes OCR merges 'Name' into the value (e.g. 'NameHUSENSAB')
+        obj['father_name'] = re.sub(r'^Name\s*[:\s]*', '', obj['father_name'], flags=re.I).strip()
 
-    # Strategy B: "Father Name" alone (possibly split across lines), value on next
-    if not obj['father_name']:
-        for i, ln in enumerate(lines):
-            ln_s = ln.strip()
-            # "Father Name" on one line
-            if re.match(r'^Father\s*Name\s*$', ln_s, re.I):
-                val = _find_value_after_label(lines, i, len(ln_s), ln_s)
-                if val and not re.match(r'^(?:dob|gender|pincode|address|id|name)\b', val, re.I):
-                    obj['father_name'] = val
-                    print(f"[DEBUG] Father (next-line): {obj['father_name']}")
-                    break
-            # "Father" alone — next line might be "Name" (OCR split), value after that
-            if re.match(r'^Father\s*$', ln_s, re.I):
-                # Check if next line is "Name" or "Name <value>"
-                if i + 1 < len(lines):
-                    next_ln = lines[i + 1].strip()
-                    m2 = re.match(r'^Name\s+(.*)', next_ln, re.I)
-                    if m2 and m2.group(1).strip():
-                        obj['father_name'] = m2.group(1).strip()
-                        print(f"[DEBUG] Father (split label, same-line value): {obj['father_name']}")
-                        break
-                    elif re.match(r'^Name\s*$', next_ln, re.I):
-                        # "Name" alone — value on line after that
-                        if i + 2 < len(lines):
-                            val = lines[i + 2].strip()
-                            if val and not re.match(r'^(?:dob|gender|pincode|address|id)\b', val, re.I):
-                                obj['father_name'] = val
-                                print(f"[DEBUG] Father (split label, next-next-line): {obj['father_name']}")
-                                break
-
-    # Strategy C: per-line search for "Father Name <value>" with flexible spacing
+    # Strategy B: Merged line regex (handles "Dob Father NameHUSENSAB")
     if not obj['father_name']:
         for ln in lines:
-            m = re.search(
-                r'Father\s*Name\s*[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
-                ln.strip(), re.I
-            )
+            m = re.search(r'Father\s*Name\s*[:\s]*([A-Z]+(?:\s+[A-Z]+)*)', ln, re.I)
             if m:
-                val = m.group(1).strip()
-                # Reject if it's a label keyword
-                if not re.match(r'^(?:dob|gender|pincode|address|id)\b', val, re.I):
-                    obj['father_name'] = val
-                    print(f"[DEBUG] Father (line search): {obj['father_name']}")
-                    break
+                obj['father_name'] = _clean_val(m.group(1))
+                break
 
-    # Strategy D: find a name-like value that isn't the person's name
-    # Only search in the table/values section (after "XML Verified" marker)
+    # Strategy B: split labels "Father" ... "Name" (merged with Gender or something)
+    if not obj['father_name']:
+         for i, ln in enumerate(lines):
+             if re.search(r'^[\s|]*Father[\s|]*$', ln.strip(), re.I):
+                 # Look at next line, might be "Name Gender Male" or "Name Md Irfan"
+                 if i + 1 < len(lines):
+                     next_ln = lines[i+1].strip()
+                     m = re.search(r'^Name\s+(.*?)(?:\s+Gender|$)', next_ln, re.I)
+                     if m:
+                         obj['father_name'] = _clean_val(m.group(1))
+                         break
+                     # If next line is just "Name", try the line after that
+                     if re.match(r'^Name\s*$', next_ln, re.I) and i + 2 < len(lines):
+                         obj['father_name'] = _clean_val(lines[i+2])
+                         break
+
+    # Strategy C: name-like fallback
     if not obj['father_name'] and obj['name']:
-        person_name_lower = obj['name'].strip().lower()
-        # Find table start marker
-        table_start = 0
-        for i, ln in enumerate(lines):
-            if re.search(r'XML\s*Verified', ln, re.I):
-                table_start = i + 1
-                break
-        for ln in lines[table_start:]:
-            s = ln.strip()
-            # Must look like a name: 2-3 title-case words, all alpha
-            if not re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}$', s):
-                continue
-            # Must not be the person's own name
-            if s.lower() == person_name_lower:
-                continue
-            # Must not be a label or keyword
-            if re.match(r'^(?:Name|Dob|Gender|Pincode|Address|Father|Male|Female|'
-                        r'Transgender|Detailed|Report|Verified|Approved|Aadhaar)$', s, re.I):
-                continue
-            obj['father_name'] = s
-            print(f"[DEBUG] Father (name-like fallback): {obj['father_name']}")
-            break
-
-    # ===================================================================
-    # 5. GENDER — MALE / FEMALE keyword search
-    # ===================================================================
-    # Strategy A: "Gender <value>" on same line
-    for ln in lines:
-        m = re.match(r'^Gender\s+(.+)', ln.strip(), re.I)
-        if m:
-            val = m.group(1).strip()
-            if re.match(r'^(?:male|female|transgender)\b', val, re.I):
-                obj['gender'] = val.upper()
-                print(f"[DEBUG] Gender (same-line): {obj['gender']}")
-                break
-
-    # Strategy B: "Gender" alone, value on next line
-    if not obj['gender']:
-        for i, ln in enumerate(lines):
-            if re.match(r'^Gender\s*$', ln.strip(), re.I):
-                val = _find_value_after_label(lines, i, len(ln.strip()), ln.strip())
-                if val and re.match(r'^(?:male|female|transgender)\b', val, re.I):
-                    obj['gender'] = val.strip().upper()
-                    print(f"[DEBUG] Gender (next-line): {obj['gender']}")
+        person_name_lower = obj['name'].lower()
+        table_started = False
+        for ln in lines:
+            if 'XML Verified' in ln: table_started = True
+            if not table_started: continue
+            s = _clean_val(ln)
+            if re.match(r'^[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){1,2}$', s):
+                if s.lower() != person_name_lower and not re.match(r'^(?:Name|Dob|Gender|Pincode|Address|Father|Male|Female)$', s, re.I):
+                    obj['father_name'] = s
                     break
 
-    # Strategy C: standalone MALE/FEMALE anywhere in lines (fallback)
+    # ===================================================================
+    # 5. GENDER
+    # ===================================================================
+    gender_val = _find_value_in_lines(lines, r'Gender')
+    if gender_val and re.match(r'^(?:male|female|transgender)', gender_val, re.I):
+        obj['gender'] = gender_val.upper()
+    
     if not obj['gender']:
         for ln in lines:
             m = re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', ln, re.I)
             if m:
                 obj['gender'] = m.group(1).upper()
-                print(f"[DEBUG] Gender (keyword search): {obj['gender']}")
                 break
 
     # ===================================================================
-    # 6. PINCODE — 6-digit number
+    # 6. PINCODE & ADDRESS
     # ===================================================================
-    pincode = ""
-    for ln in lines:
-        m = re.match(r'^Pincode\s+(\d{6})\b', ln.strip(), re.I)
-        if m:
-            pincode = m.group(1)
-            break
+    pincode = _find_value_in_lines(lines, r'Pincode')
     if not pincode:
-        for i, ln in enumerate(lines):
-            if re.match(r'^Pincode\s*$', ln.strip(), re.I):
-                val = _find_value_after_label(lines, i, len(ln.strip()), ln.strip())
-                if val:
-                    m = re.match(r'^(\d{6})\b', val)
-                    if m:
-                        pincode = m.group(1)
-                        break
+        m = re.search(r'\b(\d{6})\b', text)
+        if m: pincode = m.group(1)
 
-    # ===================================================================
-    # 7. ADDRESS — collect from "Address" label through end / next section
-    # ===================================================================
+    # Address collection: gather ALL lines between "XML Verified" and End 
+    # that look like address content, filtering out known labels/values.
     addr_parts = []
-
-    def _is_address_line(line: str) -> bool:
-        """Check if a line looks like address content (not a stray value)."""
-        s = line.strip()
-        if not s:
-            return False
-        # Reject: bare labels
-        if _ALL_LABEL_RE.match(s):
-            return False
-        # Reject: masked Aadhaar
-        if re.match(r'^\*+\d{4}$', s):
-            return False
-        # Reject: bare number (e.g. pincode alone, aadhaar digits)
-        if re.match(r'^\d+$', s):
-            return False
-        # Reject: looks like a date (ordinal + month + year)
-        if re.match(r'^\d{1,2}\s*(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}$', s, re.I):
-            return False
-        # Reject: single gender keyword
-        if re.match(r'^(?:Male|Female|Transgender)$', s, re.I):
-            return False
-        # Reject: single short name-like word (no commas, no digits, <= 3 words, all alpha)
-        words = s.replace(',', '').split()
-        if len(words) <= 3 and all(w.isalpha() for w in words) and ',' not in s:
-            # Could be a name value — reject unless it has address indicators
-            if not re.search(r'\b(?:nagar|colony|ward|village|bihar|delhi|pradesh|punjab|'
-                             r'maharashtra|rajasthan|gujarat|tamil|karnataka|kerala|bengal)\b',
-                             s, re.I):
-                return False
-        return True
-
-    # Strategy A: "Address <value>" on same line, then continue collecting
+    in_table = False
     for i, ln in enumerate(lines):
-        m = re.match(r'^Address\s+(.+)', ln.strip(), re.I)
-        if m:
-            addr_parts.append(m.group(1).strip())
-            for j in range(i + 1, len(lines)):
-                next_ln = lines[j].strip()
-                if re.match(r'^(?:id\s*number|name|dob|father|gender|pincode)\b', next_ln, re.I):
-                    break
-                if _is_address_line(next_ln):
-                    addr_parts.append(next_ln)
-            break
+        if 'XML Verified' in ln:
+            in_table = True
+            continue
+        if not in_table: continue
+        
+        s = _clean_val(ln)
+        if not s: continue
+        
+        # EXCLUSIONS: Skip lines that are clearly other fields
+        if re.search(r'\*{4,}\d{4}', s): continue # Masked Aadhaar
+        if re.search(r'\d{1,2}\s*(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}', s, re.I): continue # Date
+        if re.match(r'^(?:Male|Female|Transgender)$', s, re.I): continue # Standalone gender
+        if re.search(r'^Pincode$', s, re.I): continue # Standalone label
 
-    # Strategy B: "Address" alone, value on next lines (filter non-address)
-    if not addr_parts:
-        for i, ln in enumerate(lines):
-            if re.match(r'^Address\s*$', ln.strip(), re.I):
-                for j in range(i + 1, len(lines)):
-                    next_ln = lines[j].strip()
-                    if re.match(r'^(?:id\s*number|name|dob|father|gender|pincode)\b', next_ln, re.I):
-                        break
-                    if _is_address_line(next_ln):
-                        addr_parts.append(next_ln)
-                break
+        # Stop if we hit a signature/footer section (optional)
+        if re.search(r'^(?:Note|Disclaimer|Signature)', s, re.I): break
 
-    # Strategy C: find address by content pattern (lines with commas + locations)
-    if not addr_parts:
-        for ln in lines:
-            s = ln.strip()
-            if ',' in s and re.search(r'[A-Za-z]', s):
-                # Has commas and letters — likely address
-                if not re.match(r'^(?:Customer|KYC|KID|Date)\b', s, re.I):
-                    addr_parts.append(s)
+        # Check if line looks like address component
+        is_candidate = False
+        if ',' in s or re.search(r'\b(?:Bihar|Karnataka|State|District|Village|Ward|Nagar|Colony)\b', s, re.I):
+            is_candidate = True
+        elif re.search(r'\d{6}', s): # pincode line
+            is_candidate = True
+        elif len(s.split()) >= 3 and not re.match(r'^(?:Name|Dob|Father|Gender|Pincode|Address|Id|number)', s, re.I):
+            # 3+ words and not a label
+            is_candidate = True
+            
+        if is_candidate:
+            # Final check: make sure it's not the Name or Father Name
+            if s.lower() != obj['name'].lower() and s.lower() != obj['father_name'].lower():
+                addr_parts.append(s)
 
     if addr_parts:
-        combined = ', '.join(addr_parts)
-        combined = re.sub(r',\s*,', ',', combined)
-        combined = re.sub(r'\s+', ' ', combined).strip()
-        obj['address'] = combined
+        # Deduplicate and join
+        seen = set()
+        unique_parts = []
+        for p in addr_parts:
+            if p.lower() not in seen:
+                unique_parts.append(p)
+                seen.add(p.lower())
+        obj['address'] = ', '.join(unique_parts)
         if pincode and pincode not in obj['address']:
-            obj['address'] = f"{obj['address']}, {pincode}"
+            obj['address'] += f", {pincode}"
     elif pincode:
         obj['address'] = pincode
+
+    # Final cleanup of address: multiple commas, etc.
+    obj['address'] = re.sub(r',\s*,', ',', obj['address'])
+    obj['address'] = re.sub(r'\s+', ' ', obj['address']).strip()
 
     print("\n[DEBUG] ===== KYC Report Extraction Results =====")
     for key, val in obj.items():
