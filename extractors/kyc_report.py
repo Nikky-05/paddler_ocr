@@ -96,7 +96,7 @@ def _convert_kyc_dob(dob_str: str) -> str:
 
     # Already in DD/MM/YYYY or DD-MM-YYYY format
     if re.match(r'^\d{2}[/\-]\d{2}[/\-]\d{4}$', dob_str):
-        return "".replace('-', '/')
+        return dob_str.replace('-', '/')
 
     # Pattern: "1st Jan 1995" or "23rd February 2000"
     match = re.match(
@@ -142,8 +142,8 @@ def _find_value_in_lines(lines: List[str], label_pattern: str, skip_father_for_n
             val = m.group(2).strip()
             if skip_father_for_name and 'father' in label_part:
                 continue
-            # If value is just another label keyword, it's not the value
-            if re.match(r'^(?:name|dob|father|gender|pincode|address|id)\b', val, re.I):
+            # If value is just another label keyword or boilerplate, it's not the value
+            if re.match(r'^(?:name|dob|father|gender|pincode|address|id|xml|aadhaar|verified)\b', val, re.I):
                 continue
             return _clean_val(val)
 
@@ -216,9 +216,13 @@ def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict
     if m:
         obj['name'] = _clean_val(m.group(1))
 
-    # Strategy B: table scan
-    if not obj['name']:
-        obj['name'] = _find_value_in_lines(lines, r'(?<!Father\s)Name', skip_father_for_name=True)
+    # Strategy B: table scan (prefer this if longer or if header name looks like a summary)
+    table_name = _find_value_in_lines(lines, r'(?<!Father\s)Name', skip_father_for_name=True)
+    if table_name:
+        if not obj['name'] or (len(table_name) > len(obj['name']) and not table_name.upper().startswith(obj['name'].upper())):
+             obj['name'] = table_name
+        elif not obj['name']:
+             obj['name'] = table_name
 
     # Strategy C: merged Name line fallback (e.g. Line 14: "number Md Furqan")
     if not obj['name']:
@@ -239,7 +243,7 @@ def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict
     if not dob_val:
         # Strategy B: Flexible search on lines since Dob can be merged with labels
         for ln in lines:
-            m = re.search(r'\bDob\s*[:\s|]*(\d{1,2}\s*(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})', ln, re.I)
+            m = re.search(r'\bD[o0]b\s*[:\s|]*(\d{1,2}\s*(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})', ln, re.I)
             if m:
                 dob_val = m.group(1).strip()
                 break
@@ -265,10 +269,13 @@ def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict
     # Strategy B: Merged line regex (handles "Dob Father NameHUSENSAB")
     if not obj['father_name']:
         for ln in lines:
-            m = re.search(r'Father\s*Name\s*[:\s]*([A-Z]+(?:\s+[A-Z]+)*)', ln, re.I)
+            m = re.search(r'Father\s*Name\s*[:\s]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*|[A-Z]+(?:\s+[A-Z]+)*)', ln, re.I)
             if m:
-                obj['father_name'] = _clean_val(m.group(1))
-                break
+                candidate = _clean_val(m.group(1))
+                # Validate candidate is not boilerplate or gender
+                if not re.match(r'^(?:Male|Female|Transgender|XML|Verified)\b', candidate, re.I):
+                    obj['father_name'] = candidate
+                    break
 
     # Strategy B: split labels "Father" ... "Name" (merged with Gender or something)
     if not obj['father_name']:
@@ -289,15 +296,29 @@ def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict
     # Strategy C: name-like fallback
     if not obj['father_name'] and obj['name']:
         person_name_lower = obj['name'].lower()
+        # Also compare against a broader set of keywords to avoid mis-picking labels
+        keywords = {'name', 'dob', 'father', 'gender', 'pincode', 'address', 'id', 'male', 'female', 'xml', 'verified', 'number'}
+        
         table_started = False
         for ln in lines:
-            if 'XML Verified' in ln: table_started = True
+            if 'XML Verified' in ln:
+                table_started = True
+                continue # Skip the boilerplate line itself
             if not table_started: continue
+            
             s = _clean_val(ln)
-            if re.match(r'^[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){1,2}$', s):
-                if s.lower() != person_name_lower and not re.match(r'^(?:Name|Dob|Gender|Pincode|Address|Father|Male|Female)$', s, re.I):
+            # Must look like a name (2+ words, capitalized)
+            if re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$', s) or re.match(r'^[A-Z]+(?:\s+[A-Z]+){1,2}$', s):
+                s_lower = s.lower()
+                # Exclude person's own name, and common labels/boilerplate
+                is_keyword = any(kw in s_lower for kw in keywords)
+                if s_lower != person_name_lower and not is_keyword:
                     obj['father_name'] = s
                     break
+
+    # Final cleanup for Father Name: if misaligned gender was picked up, clear it
+    if obj['father_name'] and obj['father_name'].upper() in ['MALE', 'FEMALE', 'TRANSGENDER']:
+        obj['father_name'] = ""
 
     # ===================================================================
     # 5. GENDER
@@ -355,7 +376,16 @@ def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict
             
         if is_candidate:
             # Final check: make sure it's not the Name or Father Name
-            if s.lower() != obj['name'].lower() and s.lower() != obj['father_name'].lower():
+            s_lower = s.lower()
+            name_lower = obj['name'].lower()
+            f_name_lower = obj['father_name'].lower() if obj['father_name'] else ""
+            
+            # Use containment check to handle partial matches/merges in address block
+            # (e.g. if the full name appears on its own line in the table)
+            is_name_match = name_lower and (name_lower in s_lower or s_lower in name_lower)
+            is_fname_match = f_name_lower and (f_name_lower in s_lower or s_lower in f_name_lower)
+            
+            if not is_name_match and not is_fname_match:
                 addr_parts.append(s)
 
     if addr_parts:
