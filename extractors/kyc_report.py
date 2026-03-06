@@ -223,7 +223,45 @@ def _extract_address(lines: List[str], name: str, father: str) -> str:
 
 
 def is_kyc_report(lines: List[str], text: str) -> bool:
-    return True
+    """Detect if document is a KYC report (not raw Aadhaar card).
+    
+    KYC Report markers:
+    - "KYC" keyword in text
+    - Table with labels: "id number", "name", "dob", "father name", etc.
+    - "KYC Status:" field
+    - Company/report header pattern
+    """
+    text_lower = text.lower()
+    
+    # KYC Report keyword indicators
+    kyc_markers = [
+        'kyc report',
+        'kyc status',
+        'customer name',
+        'customer identification',
+        'verification from'
+    ]
+    
+    # Check for KYC markers
+    has_kyc_marker = any(marker in text_lower for marker in kyc_markers)
+    
+    # Check for KYC report table structure
+    has_table_labels = all(
+        label in text_lower 
+        for label in ['id number', 'name', 'dob', 'gender']
+    )
+    
+    # If both KYC indicators found, it's likely a KYC report
+    if has_kyc_marker and has_table_labels:
+        return True
+    
+    # Additional check: if "KYC Report" explicitly in first few lines
+    first_lines = "\n".join(lines[:10]).lower()
+    if 'kyc' in first_lines and ('report' in first_lines or 'status' in first_lines):
+        return True
+    
+    # Otherwise treat as raw Aadhaar card
+    return False
 
 
 def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict:

@@ -662,7 +662,10 @@ DOC_TYPE_MAP = {
 
 
 async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
-    """Process uploaded document and return uniform response."""
+    """Process uploaded document and return uniform response.
+    
+    For Aadhaar (E): Auto-detects if document is KYC Report or raw card.
+    """
     doc_type = DOC_TYPE_MAP.get(doc_type_code.upper())
     if not doc_type:
         raise HTTPException(status_code=400, detail=f"Invalid document type code: {doc_type_code}. Valid codes: A (Passport), B (Voter ID), C (PAN), D (Driving License), E (Aadhaar)")
@@ -697,7 +700,7 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
     lines = [r['text'] for r in records]
     text = "\n".join(lines)
 
-    # KYC Report bypass — detect and extract before standard validation
+    # For Aadhaar: Check if it's a KYC Report first, else use raw card logic
     if doc_type == 'aadhaar' and is_kyc_report(lines, text):
         extracted = extract_kyc_report(lines, text, records)
         response = create_uniform_response(doc_type, extracted, records)
@@ -934,7 +937,7 @@ async def ocr_extract(
     - B: Voter ID
     - C: PAN Card
     - D: Driving License
-    - E: Aadhaar
+    - E: Aadhaar (auto-detects KYC Report vs raw card)
     
     Note: For PDF files, only the first page will be processed.
     """

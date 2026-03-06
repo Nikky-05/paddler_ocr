@@ -341,10 +341,10 @@ When validation fails, the API returns:
 **HTTP Status Code:** 400
 
 **Common Scenarios:**
-- ❌ Random image uploaded
-- ❌ Wrong document type selected (e.g., PAN card uploaded with Aadhaar type)
-- ❌ Poor quality image with unreadable text
-- ❌ Non-KYC document uploaded
+-  Random image uploaded
+-  Wrong document type selected (e.g., PAN card uploaded with Aadhaar type)
+-  Poor quality image with unreadable text
+-  Non-KYC document uploaded
 
 ---
 
@@ -491,7 +491,7 @@ All OCR responses follow a **uniform schema** regardless of document type:
 
 ---
 
-## ❌ Error Handling
+##  Error Handling
 
 ### Error Response Format
 
