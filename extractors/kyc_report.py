@@ -177,35 +177,148 @@ def _extract_pincode(text: str) -> str:
     return ""
 
 
+# def _extract_address(lines: List[str], name: str, father: str) -> str:
+
+#     address_parts = []
+#     start = False
+
+#     for line in lines:
+
+#         if "XML Verified" in line:
+#             start = True
+#             continue
+
+#         if not start:
+#             continue
+
+#         s = _clean(line)
+
+#         if not s:
+#             continue
+
+#         if re.search('|'.join(_TABLE_LABELS), s, re.I):
+#             continue
+
+#         if re.search(r'\*{4,}', s):
+#             continue
+
+#         if re.match(r'\b(MALE|FEMALE)\b', s, re.I):
+#             continue
+
+#         if re.search(DATE_PATTERN, s):
+#             continue
+
+#         if name and name.lower() in s.lower():
+#             continue
+
+#         if father and father.lower() in s.lower():
+#             continue
+
+#         if "," in s or len(s.split()) >= 3:
+#             address_parts.append(s)
+
+#     address = ", ".join(dict.fromkeys(address_parts))
+
+#     return address
+
+
+# def _extract_address(lines: List[str], name: str, father: str) -> str:
+
+#     address_parts = []
+#     capture = False
+
+#     for i, line in enumerate(lines):
+
+#         s = _clean(line)
+
+#         if not s:
+#             continue
+
+#         # start capturing when we see Address label
+#         if re.search(r'^Address', s, re.I):
+
+#             capture = True
+
+#             # remove label if address is on same line
+#             addr = re.sub(r'^Address\s*', '', s, flags=re.I).strip()
+
+#             if addr:
+#                 address_parts.append(addr)
+
+#             continue
+
+#         # stop capturing if next table label appears
+#         if capture and re.search(r'^(Id number|Name|Dob|Father Name|Gender|Pincode)\b', s, re.I):
+#             break
+
+#         if not capture:
+#             continue
+
+#         # skip noise
+#         if re.search(r'\*{4,}', s):
+#             continue
+
+#         if re.search(DATE_PATTERN, s):
+#             continue
+
+#         if re.match(r'\b(MALE|FEMALE|TRANSGENDER)\b', s, re.I):
+#             continue
+
+#         # skip name lines accidentally inside
+#         if name and name.lower() in s.lower():
+#             continue
+
+#         if father and father.lower() in s.lower():
+#             continue
+
+#         # address candidate
+#         if "," in s or len(s.split()) >= 3:
+#             address_parts.append(s)
+
+#     address = ", ".join(dict.fromkeys(address_parts))
+
+#     # cleanup commas
+#     address = re.sub(r',\s*,', ',', address)
+#     address = re.sub(r'\s+', ' ', address)
+
+#     return address.strip(" ,")
+
 def _extract_address(lines: List[str], name: str, father: str) -> str:
 
     address_parts = []
-    start = False
+    capture = False
 
-    for line in lines:
-
-        if "XML Verified" in line:
-            start = True
-            continue
-
-        if not start:
-            continue
+    for i, line in enumerate(lines):
 
         s = _clean(line)
 
         if not s:
             continue
 
-        if re.search('|'.join(_TABLE_LABELS), s, re.I):
+        if re.search(r'^Address', s, re.I):
+
+            capture = True
+
+            addr = re.sub(r'^Address\s*', '', s, flags=re.I).strip()
+
+            if addr:
+                address_parts.append(addr)
+
+            continue
+
+        if capture and re.search(r'^(Id number|Name|Dob|Father Name|Gender|Pincode)\b', s, re.I):
+            break
+
+        if not capture:
             continue
 
         if re.search(r'\*{4,}', s):
             continue
 
-        if re.match(r'\b(MALE|FEMALE)\b', s, re.I):
+        if re.search(DATE_PATTERN, s):
             continue
 
-        if re.search(DATE_PATTERN, s):
+        if re.match(r'\b(MALE|FEMALE|TRANSGENDER)\b', s, re.I):
             continue
 
         if name and name.lower() in s.lower():
@@ -214,12 +327,28 @@ def _extract_address(lines: List[str], name: str, father: str) -> str:
         if father and father.lower() in s.lower():
             continue
 
+        # original rule
         if "," in s or len(s.split()) >= 3:
             address_parts.append(s)
+            continue
+
+        # NEW horizontal address rule
+        if re.search(r'\b(S/O|C/O|D/O|W/O)\b', s, re.I):
+            address_parts.append(s)
+            continue
+
+        # NEW pincode continuation
+        if re.search(r'\b\d{6}\b', s):
+            address_parts.append(s)
+            continue
 
     address = ", ".join(dict.fromkeys(address_parts))
 
-    return address
+    address = re.sub(r',\s*,', ',', address)
+    address = re.sub(r'\s+', ' ', address)
+
+    return address.strip(" ,")
+
 
 
 def is_kyc_report(lines: List[str], text: str) -> bool:
