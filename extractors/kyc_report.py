@@ -177,177 +177,224 @@ def _extract_pincode(text: str) -> str:
     return ""
 
 
-# def _extract_address(lines: List[str], name: str, father: str) -> str:
-
-#     address_parts = []
-#     start = False
-
-#     for line in lines:
-
-#         if "XML Verified" in line:
-#             start = True
-#             continue
-
-#         if not start:
-#             continue
-
-#         s = _clean(line)
-
-#         if not s:
-#             continue
-
-#         if re.search('|'.join(_TABLE_LABELS), s, re.I):
-#             continue
-
-#         if re.search(r'\*{4,}', s):
-#             continue
-
-#         if re.match(r'\b(MALE|FEMALE)\b', s, re.I):
-#             continue
-
-#         if re.search(DATE_PATTERN, s):
-#             continue
-
-#         if name and name.lower() in s.lower():
-#             continue
-
-#         if father and father.lower() in s.lower():
-#             continue
-
-#         if "," in s or len(s.split()) >= 3:
-#             address_parts.append(s)
-
-#     address = ", ".join(dict.fromkeys(address_parts))
-
-#     return address
+def _is_noise(s: str) -> bool:
+    """Check if a cleaned line is noise (not address content)."""
+    if not s:
+        return True
+    if re.search(r'\*{4,}', s):
+        return True
+    if re.match(r'^(MALE|FEMALE|TRANSGENDER)$', s, re.I):
+        return True
+    if re.match(r'^(XML\s*Verified|AADHAAR|KYC|Detailed|Report)', s, re.I):
+        return True
+    if re.match(r'^(SPEEL|FINANCE|Customer|Verification|Date|KID)', s, re.I):
+        return True
+    if re.match(r'^\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', s, re.I):
+        return True
+    return False
 
 
-# def _extract_address(lines: List[str], name: str, father: str) -> str:
+def _is_table_label(s: str) -> bool:
+    """Check if line is a table row label (not address content)."""
+    return bool(re.match(
+        r'^(Id\s*number|Name|Dob|Father\s*Name|Gender|Pincode)\b', s, re.I
+    ))
 
-#     address_parts = []
-#     capture = False
 
-#     for i, line in enumerate(lines):
+def _clean_address(addr: str) -> str:
+    """Clean up final address string."""
+    # remove leaked "Address" label word (full or partial) anywhere
+    addr = re.sub(r'\b[Aa]ddres\w*\b', '', addr)
+    addr = re.sub(r'\b[Dd]dress\b', '', addr)
+    addr = re.sub(r'\bddress\b', '', addr)
+    addr = re.sub(r',\s*,', ',', addr)
+    addr = re.sub(r'\s+', ' ', addr)
+    return addr.strip(" ,")
 
-#         s = _clean(line)
 
-#         if not s:
-#             continue
+def _extract_address(lines: List[str], name: str, father: str,
+                     records: List[Dict] = None) -> str:
+    """Extract address using multiple strategies for robustness.
 
-#         # start capturing when we see Address label
-#         if re.search(r'^Address', s, re.I):
+    KYC table structure:  Address is always the LAST row.
+    OCR may split multi-line addresses or reorder label vs value.
+    """
 
-#             capture = True
+    print("\n[DEBUG] ===== Address Extraction =====")
+    print(f"[DEBUG] Lines ({len(lines)}):")
+    for i, ln in enumerate(lines):
+        print(f"[DEBUG]   {i}: '{ln}'")
 
-#             # remove label if address is on same line
-#             addr = re.sub(r'^Address\s*', '', s, flags=re.I).strip()
+    # Strategy 2 (after Pincode) is most reliable: Address is always last
+    # row in KYC table, and Pincode is always just above it.
+    addr = _strategy_after_pincode(lines)
+    if addr and len(addr) > 10:
+        print(f"[DEBUG] Strategy 2 (after Pincode) => '{addr}'")
+        return addr
 
-#             if addr:
-#                 address_parts.append(addr)
+    # Fallback: find "Address" label in lines
+    addr = _strategy_address_label(lines)
+    if addr and len(addr) > 10:
+        print(f"[DEBUG] Strategy 1 (Address label) => '{addr}'")
+        return addr
 
-#             continue
+    # Fallback: regex S/O, C/O, D/O, W/O in full text
+    addr = _strategy_care_of_regex("\n".join(lines))
+    if addr and len(addr) > 10:
+        print(f"[DEBUG] Strategy 3 (C/O regex) => '{addr}'")
+        return addr
 
-#         # stop capturing if next table label appears
-#         if capture and re.search(r'^(Id number|Name|Dob|Father Name|Gender|Pincode)\b', s, re.I):
-#             break
+    # Last resort: collect comma-heavy lines after table
+    addr = _strategy_comma_lines(lines)
+    if addr and len(addr) > 10:
+        print(f"[DEBUG] Strategy 4 (comma lines) => '{addr}'")
+        return addr
 
-#         if not capture:
-#             continue
+    print("[DEBUG] All strategies failed for address")
+    return ""
 
-#         # skip noise
-#         if re.search(r'\*{4,}', s):
-#             continue
 
-#         if re.search(DATE_PATTERN, s):
-#             continue
-
-#         if re.match(r'\b(MALE|FEMALE|TRANSGENDER)\b', s, re.I):
-#             continue
-
-#         # skip name lines accidentally inside
-#         if name and name.lower() in s.lower():
-#             continue
-
-#         if father and father.lower() in s.lower():
-#             continue
-
-#         # address candidate
-#         if "," in s or len(s.split()) >= 3:
-#             address_parts.append(s)
-
-#     address = ", ".join(dict.fromkeys(address_parts))
-
-#     # cleanup commas
-#     address = re.sub(r',\s*,', ',', address)
-#     address = re.sub(r'\s+', ' ', address)
-
-#     return address.strip(" ,")
-
-def _extract_address(lines: List[str], name: str, father: str) -> str:
+def _strategy_address_label(lines: List[str]) -> str:
+    """Find 'Address' label and collect value from same line + subsequent lines."""
 
     address_parts = []
     capture = False
 
     for i, line in enumerate(lines):
-
         s = _clean(line)
-
         if not s:
             continue
 
-        if re.search(r'^Address', s, re.I):
-
+        # flexible match: "Address", "AddressS/O", "Addres" etc.
+        if not capture and re.search(r'Addres', s, re.I):
             capture = True
-
-            addr = re.sub(r'^Address\s*', '', s, flags=re.I).strip()
-
+            # remove the label portion
+            addr = re.sub(r'^Addres\w*\s*', '', s, flags=re.I).strip()
             if addr:
                 address_parts.append(addr)
-
             continue
 
-        if capture and re.search(r'^(Id number|Name|Dob|Father Name|Gender|Pincode)\b', s, re.I):
+        if capture and _is_table_label(s):
             break
 
         if not capture:
             continue
 
+        if _is_noise(s):
+            continue
+
+        address_parts.append(s)
+
+    if not address_parts:
+        return ""
+
+    return _clean_address(", ".join(dict.fromkeys(address_parts)))
+
+
+def _strategy_after_pincode(lines: List[str]) -> str:
+    """Address is always the last row — collect everything after the Pincode row.
+
+    In narrow images, OCR may read the address value lines BEFORE the 'Address'
+    label because the label is vertically centered in the cell. But Pincode is
+    always the row above, so everything after Pincode (excluding noise and
+    the 'Address' label word itself) is the address.
+    """
+
+    pincode_idx = -1
+
+    for i, line in enumerate(lines):
+        s = _clean(line)
+        if re.match(r'^Pincode\b', s, re.I):
+            pincode_idx = i
+            break
+
+    if pincode_idx < 0:
+        # also try to find a standalone 6-digit line preceded by "Gender Male"
+        for i, line in enumerate(lines):
+            s = _clean(line)
+            if re.match(r'^(Gender\s+)?(Male|Female)', s, re.I):
+                # pincode might be the next line
+                if i + 1 < len(lines) and re.match(r'^\d{6}$', lines[i+1].strip()):
+                    pincode_idx = i + 1
+                    break
+
+    if pincode_idx < 0:
+        return ""
+
+    address_parts = []
+    for line in lines[pincode_idx + 1:]:
+        s = _clean(line)
+        if not s:
+            continue
+
+        if _is_noise(s):
+            continue
+
+        if _is_table_label(s):
+            continue
+
+        # strip the "Address" label word if present
+        s = re.sub(r'^Addres\w*\s*', '', s, flags=re.I).strip()
+        if not s:
+            continue
+
+        address_parts.append(s)
+
+    if not address_parts:
+        return ""
+
+    return _clean_address(", ".join(dict.fromkeys(address_parts)))
+
+
+def _strategy_care_of_regex(text: str) -> str:
+    """Extract address by finding S/O, C/O, D/O, W/O pattern in full text."""
+
+    # Match: S/O: Name, addr parts, ..., pincode, ..., state
+    m = re.search(
+        r'([SCDW]/O\s*[:\-]?\s*[A-Za-z][\w\s,./\-]+(?:\d{6})[\w\s,./\-]*)',
+        text, re.I
+    )
+    if m:
+        addr = m.group(1).strip()
+        # clean up: remove trailing noise
+        addr = re.split(r'\n(?=\s*(?:Id\s*number|Name|Dob|Father|Gender|Pincode))', addr)[0]
+        return _clean_address(addr)
+
+    return ""
+
+
+def _strategy_comma_lines(lines: List[str]) -> str:
+    """Last resort: find comma-heavy lines after 'XML Verified' section."""
+
+    capture = False
+    address_parts = []
+
+    for line in lines:
+        s = _clean(line)
+        if not s:
+            continue
+
+        if 'XML Verified' in line or 'Xml Verified' in line:
+            capture = True
+            continue
+
+        if not capture:
+            continue
+
+        if _is_noise(s) or _is_table_label(s):
+            continue
+
         if re.search(r'\*{4,}', s):
             continue
 
-        if re.search(DATE_PATTERN, s):
-            continue
-
-        if re.match(r'\b(MALE|FEMALE|TRANSGENDER)\b', s, re.I):
-            continue
-
-        if name and name.lower() in s.lower():
-            continue
-
-        if father and father.lower() in s.lower():
-            continue
-
-        # original rule
-        if "," in s or len(s.split()) >= 3:
+        # address-like: has commas and looks like location text
+        if ',' in s and len(s) > 15:
             address_parts.append(s)
-            continue
 
-        # NEW horizontal address rule
-        if re.search(r'\b(S/O|C/O|D/O|W/O)\b', s, re.I):
-            address_parts.append(s)
-            continue
+    if not address_parts:
+        return ""
 
-        # NEW pincode continuation
-        if re.search(r'\b\d{6}\b', s):
-            address_parts.append(s)
-            continue
-
-    address = ", ".join(dict.fromkeys(address_parts))
-
-    address = re.sub(r',\s*,', ',', address)
-    address = re.sub(r'\s+', ' ', address)
-
-    return address.strip(" ,")
+    return _clean_address(", ".join(dict.fromkeys(address_parts)))
 
 
 
@@ -425,7 +472,8 @@ def extract_kyc_report(lines: List[str], text: str, records: List[Dict]) -> Dict
     obj["address"] = _extract_address(
         lines,
         obj["name"],
-        obj["father_name"]
+        obj["father_name"],
+        records
     )
 
     if pincode and pincode not in obj["address"]:
