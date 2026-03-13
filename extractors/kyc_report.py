@@ -36,16 +36,55 @@ def _clean_label(s: Optional[str]) -> str:
     return s.strip()
 
 
+# def _normalize_ordinal(s: str) -> str:
+#     return re.sub(r'(\d)\s+(st|nd|rd|th)', r'\1\2', s, flags=re.I)
 def _normalize_ordinal(s: str) -> str:
-    return re.sub(r'(\d)\s+(st|nd|rd|th)', r'\1\2', s, flags=re.I)
+    # Handle fully split: OCR may read "31st" as "3 1 st"
+    s = re.sub(r'(\d)\s+(\d)\s+(st|nd|rd|th)', r'\1\2\3', s, flags=re.I)
+    # Handle split digits: OCR may read "31st" as "3 1st"
+    s = re.sub(r'(\d)\s+(\d)(st|nd|rd|th)', r'\1\2\3', s, flags=re.I)
+    # Handle normal split: "31 st" → "31st"
+    s = re.sub(r'(\d)\s+(st|nd|rd|th)', r'\1\2', s, flags=re.I)
+    return s
+
+
+def _fix_split_ordinal(s: str) -> str:
+    """Rejoin OCR-split two-digit ordinal day numbers.
+
+    OCR sometimes reads '31st' as '3 1 st' or '3 1st' due to spacing artefacts.
+    This collapses them back before any date parsing:
+      '3 1 st'  -> '31st'
+      '3 1st'   -> '31st'
+      '2 2 nd'  -> '22nd'
+    """
+    # Step 1: "3 1 st" -> "31st"  (digit SPACE digit SPACE ordinal)
+    s = re.sub(r'(\d)\s+(\d)\s+(st|nd|rd|th)\b', r'\1\2\3', s, flags=re.I)
+    # Step 2: "3 1st" -> "31st"  (digit SPACE digit+ordinal already joined)
+    s = re.sub(r'(\d)\s+(\d(?:st|nd|rd|th))\b', r'\1\2', s, flags=re.I)
+    return s
 
 
 def _convert_dob(dob: str) -> str:
 
+    dob = dob.strip()
+
+    # Fix OCR-split ordinals like '3 1 st' -> '31st' BEFORE any other processing
+    dob = _fix_split_ordinal(dob)
+
+    # Passthrough: already in DD/MM/YYYY or DD-MM-YYYY format
+    m_num = re.match(r'^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$', dob)
+    if m_num:
+        day = m_num.group(1).zfill(2)
+        month = m_num.group(2).zfill(2)
+        year = m_num.group(3)
+        return f"{day}/{month}/{year}"
+
     dob = _normalize_ordinal(dob)
 
+    # Use \b boundary and \d{1,2} anchored so it doesn't partially match
+    # e.g. "31st" -> after _normalize_ordinal -> "31st" (no space) so group(1)=31
     m = re.search(
-        r'(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\s+(\d{4})',
+        r'(?<![\d])(\d{1,2})(?:st|nd|rd|th)?[\s]+([A-Za-z]+)[\s]+(\d{4})',
         dob
     )
 
@@ -114,19 +153,56 @@ def _extract_aadhaar(text: str) -> str:
     return ""
 
 
+# Numeric date patterns: DD/MM/YYYY, DD-MM-YYYY, YYYY/MM/DD, YYYY-MM-DD
+_NUMERIC_DATE_PATTERN = r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b|\b(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\b'
+
+
+def _convert_numeric_date(m: re.Match) -> str:
+    """Convert a numeric date regex match to DD/MM/YYYY."""
+    if m.group(1):  # DD/MM/YYYY
+        day = m.group(1).zfill(2)
+        month = m.group(2).zfill(2)
+        year = m.group(3)
+    else:  # YYYY/MM/DD
+        year = m.group(4)
+        month = m.group(5).zfill(2)
+        day = m.group(6).zfill(2)
+    return f"{day}/{month}/{year}"
+
+
 def _extract_dob(lines: List[str], text: str) -> str:
 
     dob_val = _find_label_value(lines, r'\bDob\b')
 
+    print(f"[DEBUG DOB] raw dob_val from label = {repr(dob_val)}")
+
     if dob_val:
+        # First try text-based month name (e.g. "31st Jan 2008")
         dob = _convert_dob(dob_val)
+        print(f"[DEBUG DOB] _convert_dob({repr(dob_val)}) = {repr(dob)}")
+        if dob:
+            return dob
+        # Then try numeric format directly in the fetched value
+        m_num = re.search(_NUMERIC_DATE_PATTERN, dob_val)
+        if m_num:
+            result = _convert_numeric_date(m_num)
+            print(f"[DEBUG DOB] numeric match in dob_val => {repr(result)}")
+            return result
+
+    # Fallback: text-based date in full text (e.g. "31st Jan 2008")
+    m = re.search(DATE_PATTERN, text)
+    if m:
+        print(f"[DEBUG DOB] DATE_PATTERN matched in full text: {repr(m.group())}")
+        dob = _convert_dob(m.group())
         if dob:
             return dob
 
-    m = re.search(DATE_PATTERN, text)
-
-    if m:
-        return _convert_dob(m.group())
+    # Fallback: numeric date in full text
+    m_num = re.search(_NUMERIC_DATE_PATTERN, text)
+    if m_num:
+        result = _convert_numeric_date(m_num)
+        print(f"[DEBUG DOB] numeric fallback in full text => {repr(result)}")
+        return result
 
     return ""
 
