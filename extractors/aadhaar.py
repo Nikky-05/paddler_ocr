@@ -18,6 +18,8 @@ from .utils import (
     looks_like_uidai_text, is_likely_garbage, has_reasonable_vowel_ratio,
     extract_english_only, validate_verhoeff
 )
+from logging_config import get_logger
+logger = get_logger("aadhaar")
 
 
 def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
@@ -45,7 +47,7 @@ def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
 
     # Back side: has address label but no DOB and no gender
     if has_address_label and not has_dob and not has_gender:
-        print("[DEBUG] Detected Aadhaar BACK side")
+        logger.debug("Detected Aadhaar BACK side")
         return True
 
     return False
@@ -75,23 +77,23 @@ def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Di
         "nationality": ""
     }
 
-    print("\n[DEBUG] ===== Aadhaar BACK Side Extraction Started =====")
-    print(f"[DEBUG] Total OCR lines: {len(lines)}")
-    print("[DEBUG] OCR Lines:")
+    logger.debug("===== Aadhaar BACK Side Extraction Started =====")
+    logger.debug(f"Total OCR lines: {len(lines)}")
+    logger.debug("OCR Lines:")
     for i, ln in enumerate(lines[:20]):
-        print(f"[DEBUG]   Line {i}: '{ln}'")
+        logger.debug(f"  Line {i}: '{ln}'")
 
     # Extract Aadhaar number (same logic as front side)
     obj['aadhaar_number'] = extract_aadhaar_number(text, lines)
-    print(f"[DEBUG] Aadhaar Number: {obj['aadhaar_number']}")
+    logger.debug(f"Aadhaar Number: {obj['aadhaar_number']}")
 
     # Extract VID
     obj['vid'] = extract_vid(text, lines)
-    print(f"[DEBUG] VID: {obj['vid']}")
+    logger.debug(f"VID: {obj['vid']}")
 
     # Extract address (use existing logic - works well with clean left-column text)
     obj['address'] = extract_address(lines, "")
-    print(f"[DEBUG] Address: {obj['address'][:100]}..." if len(obj['address']) > 100 else f"[DEBUG] Address: {obj['address']}")
+    logger.debug(f"Address: {obj['address'][:100]}..." if len(obj['address']) > 100 else f"Address: {obj['address']}")
 
     # Extract relation names (father/husband/mother) using shared logic
     father, mother, husband = extract_relation_names(lines, "")
