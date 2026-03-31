@@ -18,6 +18,8 @@ from .utils import (
     looks_like_uidai_text, is_likely_garbage, has_reasonable_vowel_ratio,
     extract_english_only, validate_verhoeff
 )
+from logging_config import get_logger
+logger = get_logger("aadhaar")
 
 
 def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
@@ -28,9 +30,9 @@ def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
     - Does NOT have DOB or gender (front side only fields)
     - Typically has bilingual text (English + Hindi/regional language) in two columns
     """
-    # Back side indicators
+    # Back side indicators (handle Hindi पता, Marathi पत्ता, and English Address)
     has_address_label = bool(
-        re.search(r'\bAddress\s*:', text, re.I) or 'पत्ता' in text
+        re.search(r'\bAddress\s*:', text, re.I) or 'पत्ता' in text or 'पता' in text
     )
 
     # Front side indicators (should be absent on back)
@@ -45,7 +47,7 @@ def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
 
     # Back side: has address label but no DOB and no gender
     if has_address_label and not has_dob and not has_gender:
-        print("[DEBUG] Detected Aadhaar BACK side")
+        logger.debug("Detected Aadhaar BACK side")
         return True
 
     return False
@@ -75,29 +77,26 @@ def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Di
         "nationality": ""
     }
 
-    print("\n[DEBUG] ===== Aadhaar BACK Side Extraction Started =====")
-    print(f"[DEBUG] Total OCR lines: {len(lines)}")
-    print("[DEBUG] OCR Lines:")
+    logger.debug("===== Aadhaar BACK Side Extraction Started =====")
+    logger.debug(f"Total OCR lines: {len(lines)}")
+    logger.debug("OCR Lines:")
     for i, ln in enumerate(lines[:20]):
-        print(f"[DEBUG]   Line {i}: '{ln}'")
+        logger.debug(f"  Line {i}: '{ln}'")
 
     # Extract Aadhaar number (same logic as front side)
     obj['aadhaar_number'] = extract_aadhaar_number(text, lines)
-    print(f"[DEBUG] Aadhaar Number: {obj['aadhaar_number']}")
+    logger.debug(f"Aadhaar Number: {obj['aadhaar_number']}")
 
     # Extract VID
     obj['vid'] = extract_vid(text, lines)
-    print(f"[DEBUG] VID: {obj['vid']}")
+    logger.debug(f"VID: {obj['vid']}")
 
     # Extract address (use existing logic - works well with clean left-column text)
     obj['address'] = extract_address(lines, "")
-    print(f"[DEBUG] Address: {obj['address'][:100]}..." if len(obj['address']) > 100 else f"[DEBUG] Address: {obj['address']}")
+    logger.debug(f"Address: {obj['address'][:100]}..." if len(obj['address']) > 100 else f"Address: {obj['address']}")
 
-    # Extract relation names (father/husband/mother) using shared logic
-    father, mother, husband = extract_relation_names(lines, "")
-    obj['father_name'] = father
-    obj['mother_name'] = mother
-    obj['husband_name'] = husband
+    # Back side: relation names are part of the address (S/O, D/O etc.)
+    # so don't populate separate father/mother/husband fields
 
     print(f"[DEBUG] Father: {obj['father_name']}")
     print(f"[DEBUG] Mother: {obj['mother_name']}")
@@ -440,6 +439,11 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
         if any(p in text_lower for p in skip_patterns):
             return False
 
+        # Skip if contains relation markers (S/O, C/O, D/O, W/O)
+        # These lines contain father/husband names, not the person's name
+        if re.search(r'\b(S/O|C/O|D/O|W/O|SON\s*OF|DAUGHTER\s*OF|WIFE\s*OF|CARE\s*OF)\b', text, re.I):
+            return False
+
         # Skip if contains digits
         if re.search(r'\d', text):
             return False
@@ -490,11 +494,21 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
     # -------------------------------------------------------------------------
     # Strategy 1: Find English name after Hindi (Devanagari) name
     # This is the most reliable pattern for Aadhaar cards
+    # Also handles merged lines where Hindi+English name are on same line
     # -------------------------------------------------------------------------
     print("[DEBUG] Strategy 1: Looking for English name after Hindi name...")
-    for i in range(len(lines) - 1):
+    for i in range(len(lines)):
         if contains_devanagari(lines[i]):
-            # Check next few lines for English name
+            # First: check if this line has BOTH Devanagari AND English name
+            # (OCR may merge "आशा लक्ष्मन बिसाने ASHA LAXMAN BISANE" into one line)
+            english_part = extract_english_only(lines[i])
+            if english_part and is_valid_name_candidate(english_part):
+                name = clean_name(english_part)
+                if name and len(name) >= 5:
+                    print(f"[DEBUG] Found name in merged Devanagari+English line: '{name}'")
+                    return name
+
+            # Then: check next few lines for English name
             for j in range(i + 1, min(i + 3, len(lines))):
                 next_ln = lines[j].strip()
 
@@ -670,7 +684,9 @@ def extract_relation_names(lines: List[str], person_name: str) -> Tuple[str, str
         """Extract name after a relation marker."""
         # More flexible marker matching for S/O, S:O, S.O etc.
         # Handle cases where S/O is separated by spaces
-        flexible_marker = marker_pattern.replace('/', r'\s*[\/:]\s*')
+        # Make marker groups non-capturing so group(1) captures the name
+        nc_marker = marker_pattern.replace('(', '(?:')
+        flexible_marker = nc_marker.replace('/', r'\s*[\/:]\s*')
         match = re.search(flexible_marker + r'[:\-]?\s*([A-Za-z\.\-\s]+)', line, re.I)
         if match:
             name = match.group(1).strip()
@@ -747,41 +763,224 @@ def extract_relation_names(lines: List[str], person_name: str) -> Tuple[str, str
     return father, mother, husband
 
 
+def _clean_address_token(token: str) -> str:
+    """Clean a single address token, removing OCR garbage from bilingual column merges.
+
+    When OCR reads Aadhaar back side, English and Hindi columns merge per line.
+    After stripping Devanagari, fragments like '3ITETT', 'g', 'a' remain.
+    This function removes such garbage while keeping valid address tokens.
+    """
+    token = token.strip().strip(',-.:;')
+    if not token:
+        return ""
+
+    # Keep tokens that are clearly valid: house numbers (A-202), PIN codes (401203),
+    # known patterns like (West), (East), etc.
+    # House number pattern: letter(s)-digits or digits-letter(s)
+    if re.match(r'^[A-Za-z]-?\d+$', token) or re.match(r'^\d+-?[A-Za-z]$', token):
+        return token
+    # Pure digits (PIN code, house number)
+    if token.isdigit():
+        return token
+    # Parenthetical like (West), (East)
+    if re.match(r'^\([A-Za-z]+\)$', token):
+        return token
+
+    # Remove tokens that are single lowercase letter (garbage from Hindi strip)
+    # e.g. "g", "a" but NOT "A" (could be part of house number like A-202)
+    if len(token) == 1 and token.islower():
+        return ""
+
+    # Remove tokens that mix digits and uppercase letters in garbage patterns
+    # e.g. "3ITETT", "5HRTT" but NOT "A-202" or "401203"
+    if re.match(r'^\d+[A-Z]{2,}$', token) or re.match(r'^[A-Z]+\d+[A-Z]+$', token):
+        return ""
+
+    return token
+
+
+def _clean_address_line(line: str) -> str:
+    """Clean a full address line by removing bilingual merge garbage tokens.
+
+    Processes the line token by token, removing OCR artifacts while preserving
+    the meaningful English address components.
+    """
+    if not line:
+        return ""
+
+    # Split by comma first to handle comma-separated parts
+    parts = [p.strip() for p in line.split(',')]
+    cleaned_parts = []
+
+    for part in parts:
+        if not part:
+            continue
+        # Preserve "State - PIN" patterns (e.g. "Maharashtra - 401203")
+        if re.match(r'^[A-Za-z]+\s*-\s*\d{6}$', part.strip()):
+            cleaned_parts.append(part.strip())
+            continue
+        # Split part into words and clean each
+        words = part.split()
+        cleaned_words = []
+        for word in words:
+            cleaned = _clean_address_token(word)
+            if cleaned:
+                cleaned_words.append(cleaned)
+
+        if cleaned_words:
+            reassembled = ' '.join(cleaned_words)
+            # Skip parts that are just a single short word (likely garbage remnant)
+            if len(reassembled) > 1:
+                cleaned_parts.append(reassembled)
+
+    return ', '.join(cleaned_parts)
+
+
 def _clean_and_deduplicate_address(address_parts: List[str], person_name: str = "") -> str:
     """Helper to deduplicate and clean address parts, handling merged column artifacts."""
     if not address_parts:
         return ""
-        
-    unique_parts = []
-    seen = set()
+
+    # First pass: clean each part of bilingual merge garbage
+    cleaned_address_parts = []
     for p in address_parts:
-        # Skip if part of person name
+        cleaned = _clean_address_line(p)
+        if cleaned:
+            cleaned_address_parts.append(cleaned)
+
+    # Filter out person name only (keep S/O, D/O etc. as part of address)
+    filtered = []
+    for p in cleaned_address_parts:
         if person_name and p.upper() == person_name.upper():
             continue
-            
-        # Skip if it contains a relation marker (already extracted separately)
-        if re.search(r'\b(S/O|D/O|W/O|C/O)\b', p, re.I):
+        filtered.append(p)
+
+    # Split all parts into individual comma-separated components for better dedup
+    all_components = []
+    for p in filtered:
+        for comp in p.split(','):
+            comp = comp.strip().strip(',-.:')
+            if comp:
+                all_components.append(comp)
+
+    # Deduplicate at the component level
+    def normalize(s):
+        return re.sub(r'[^a-z0-9\s]', '', s.lower().strip())
+
+    def norm_key(s):
+        return re.sub(r'[^a-z0-9]', '', s.lower().strip())
+
+    # Clean within-component word repetitions
+    # e.g. "Giddoba Mandir Giddoba Mandir" → "Giddoba Mandir"
+    # e.g. "440035 440035" → "440035"
+    deduplicated_components = []
+    for comp in all_components:
+        words = comp.split()
+        if len(words) >= 2:
+            # Check if the second half repeats the first half
+            for split_at in range(1, len(words)):
+                first_half = [w.lower() for w in words[:split_at]]
+                second_half = [w.lower() for w in words[split_at:split_at + len(first_half)]]
+                if first_half == second_half:
+                    # Keep only the first half + any remainder after the repeat
+                    comp = ' '.join(words[:split_at] + words[split_at + len(first_half):])
+                    break
+        deduplicated_components.append(comp.strip())
+    all_components = [c for c in deduplicated_components if c]
+
+    # Remove short garbage fragments from Hindi/Marathi OCR leakage
+    # e.g. "ON 3", "O/s Anor", single letters
+    cleaned_components = []
+    for comp in all_components:
+        # Remove very short garbage fragments (e.g. "g", "a", "ON 3")
+        # but keep legitimate short components like "No 22" when part of larger context
+        alpha_only = re.sub(r'[^a-zA-Z]', '', comp)
+        if len(alpha_only) < 2:
             continue
-        
-        p_clean = p.lower().strip()
-        # Remove non-alphanumeric for comparison
-        comp_key = re.sub(r'[^a-z0-9]', '', p_clean)
-        
-        if comp_key and comp_key not in seen:
-            # Check for near-duplicates (one part contained in another)
-            # Common when horizontal OCR merges English and Marathi columns
-            is_duplicate = False
-            for seen_key in seen:
-                if len(comp_key) > 5 and len(seen_key) > 5:
-                    if comp_key in seen_key or seen_key in comp_key:
-                        is_duplicate = True
-                        break
-            
-            if not is_duplicate:
-                unique_parts.append(p)
-                seen.add(comp_key)
-    
-    addr = ', '.join(unique_parts)
+        # Remove standalone 2-letter fragments with digits that look like OCR garbage
+        if len(alpha_only) == 2 and len(comp) <= 4 and re.search(r'\d', comp):
+            continue
+        # Remove fragments that look like garbled relation markers (O/s, S/0, etc.)
+        if re.match(r'^[A-Za-z]/[a-z]\b', comp) and not re.match(r'^(S/O|D/O|W/O|C/O)\b', comp, re.I):
+            continue
+        cleaned_components.append(comp)
+    all_components = cleaned_components
+
+    # Remove exact duplicates while preserving order
+    seen_norm = set()
+    unique_components = []
+    for comp in all_components:
+        nk = norm_key(comp)
+        if nk and nk not in seen_norm:
+            unique_components.append(comp)
+            seen_norm.add(nk)
+
+    # Merge overlapping fragments: if tail words of one match head words of another,
+    # merge them into one longer component.
+    # e.g. "Lodha Shopping" + "Shopping Center" -> "Lodha Shopping Center"
+    # Only merge if result is strictly longer than both inputs (avoids absorbing subsets).
+    did_merge = True
+    while did_merge:
+        did_merge = False
+        for i in range(len(unique_components)):
+            if not unique_components[i]:
+                continue
+            words_i = normalize(unique_components[i]).split()
+            for j in range(len(unique_components)):
+                if i == j or not unique_components[j]:
+                    continue
+                words_j = normalize(unique_components[j]).split()
+                # Check if tail of i overlaps with head of j
+                for overlap_len in range(1, min(len(words_i), len(words_j)) + 1):
+                    if words_i[-overlap_len:] == words_j[:overlap_len]:
+                        # Only merge if result has MORE words than either input
+                        new_word_count = len(words_i) + len(words_j) - overlap_len
+                        if new_word_count <= max(len(words_i), len(words_j)):
+                            continue  # Skip: result isn't longer, it's a subset
+                        orig_words_j = unique_components[j].split()
+                        merged_text = unique_components[i] + ' ' + ' '.join(orig_words_j[overlap_len:])
+                        merged_text = merged_text.strip()
+                        if merged_text:
+                            # Place result at the earlier position to preserve order
+                            target = min(i, j)
+                            other = max(i, j)
+                            unique_components[target] = merged_text
+                            unique_components[other] = ""
+                            if target != i:
+                                unique_components[i] = ""
+                            did_merge = True
+                            break
+                if did_merge:
+                    break
+            if did_merge:
+                break
+        unique_components = [c for c in unique_components if c]
+
+    # Remove fragment components that are clearly redundant.
+    # A component is removed if ALL its words appear in another longer component.
+    # e.g. "Center" removed when "Lodha Shopping Center" exists.
+    # e.g. "S/O Shrirang Shende" removed when "S/O Shrirang Shende Plot No 22" exists.
+    final_components = []
+    for i, comp in enumerate(unique_components):
+        words_i = normalize(comp).split()
+        if not words_i:
+            continue
+        is_fragment = False
+        for j, other in enumerate(unique_components):
+            if i == j:
+                continue
+            words_j = normalize(other).split()
+            # Only remove if the other component is strictly longer
+            if len(words_j) > len(words_i):
+                # Check if all words of comp appear in other
+                if all(w in words_j for w in words_i):
+                    is_fragment = True
+                    break
+        if is_fragment:
+            continue
+        final_components.append(comp)
+
+    addr = ', '.join(final_components)
     # Final cleanup
     addr = re.sub(r',\s*,', ',', addr)
     addr = re.sub(r'\s+', ' ', addr)
@@ -814,20 +1013,53 @@ def extract_address(lines: List[str], person_name: str) -> str:
         r'(/|\b)(MALE|FEMALE)\b',
     ]
 
-    # Strategy 1: Find "Address:" label
-    for i, ln in enumerate(lines):
-        if re.search(r'\bAddress\b|पता\s*:', ln, re.I):
-            collecting = True
-            # Start collecting from this line
-            addr_text = re.sub(r'^.*Address\s*:?\s*', '', ln, flags=re.I)
-            if addr_text.strip():
-                address_parts.append(addr_text.strip())
-            continue
+    # Strategy 1: Find English "Address:" label (preferred) or Hindi पता/पत्ता label
+    # For stacked layouts (Hindi block + English block), prefer the English "Address:" section
+    # For column layouts (side-by-side), extract_english_only filters out Devanagari
 
-        if collecting:
+    # First pass: find the English "Address:" label line index
+    english_addr_idx = -1
+    hindi_addr_idx = -1
+    for i, ln in enumerate(lines):
+        if re.search(r'\bAddress\s*:', ln, re.I) and english_addr_idx == -1:
+            english_addr_idx = i
+        if re.search(r'पत्ता|पता', ln) and hindi_addr_idx == -1:
+            hindi_addr_idx = i
+
+    # Prefer English "Address:" label; fall back to Hindi label only if no English found
+    start_idx = english_addr_idx if english_addr_idx >= 0 else hindi_addr_idx
+
+    if start_idx >= 0:
+        for i in range(start_idx, len(lines)):
+            ln = lines[i]
+
+            if not collecting:
+                collecting = True
+                # Start collecting from this line (extract text after "Address:")
+                addr_text = re.sub(r'^.*Address\s*:?\s*', '', ln, flags=re.I)
+                # Also strip Hindi "पत्ता/पता :" prefix if present
+                addr_text = re.sub(r'^.*पत्ता\s*:?\s*', '', addr_text)
+                addr_text = re.sub(r'^.*पता\s*:?\s*', '', addr_text).strip()
+                addr_text = extract_english_only(addr_text).strip()
+                if addr_text:
+                    address_parts.append(addr_text)
+                continue
+
             # 1. Skip lines that are purely boilerplate
-            pure_skip = [r'signature', r'help@', r'www\.', r'Aadhaar\s*No', r'VID\s*:']
+            pure_skip = [r'signature', r'help@', r'www\.', r'Aadhaar\s*No', r'VID\s*:',
+                         r'\b1947\b', r'uidai\.gov']
             if any(re.search(p, ln, re.I) for p in pure_skip):
+                continue
+
+            # 1b. Skip lines with Aadhaar number (12 digits spaced or continuous)
+            if re.search(r'\b\d{4}\s+\d{4}\s+\d{4}\b', ln) or re.search(r'\b\d{12}\b', ln):
+                break
+
+            # 1c. Skip purely Devanagari lines (Hindi/Marathi text on back side)
+            english_content = extract_english_only(ln).strip()
+            # Remove just digits and punctuation to check if any real English words remain
+            english_words_only = re.sub(r'[^a-zA-Z\s]', '', english_content).strip()
+            if contains_devanagari(ln) and len(english_words_only) < 3:
                 continue
 
             # 2. Clean merged boilerplate from line instead of skipping
@@ -835,12 +1067,14 @@ def extract_address(lines: List[str], person_name: str) -> str:
             clean_ln = ln
             for p in [r'Date of Birth', r'\bDOB\b', r'\d{2}/\d{2}/\d{4}', r'\b(MALE|FEMALE|TRANSGENDER)\b', r'(/|\b)(MALE|FEMALE)\b']:
                 clean_ln = re.sub(p, '', clean_ln, flags=re.I).strip()
-            
-            # 3. Final cleaning of individual line
+
+            # 3. Extract only English text, strip Devanagari and other scripts
             clean_ln = extract_english_only(clean_ln).strip()
+            # Strip "Address" label if it appears in subsequent lines (stacked cards)
+            clean_ln = re.sub(r'\bAddress\s*:?\s*', '', clean_ln, flags=re.I).strip()
             # Remove leading/trailing symbols that might remain after cleaning
             clean_ln = re.sub(r'^[:\-,\.\s]+|[:\-,\.\s]+$', '', clean_ln).strip()
-            
+
             if clean_ln:
                 address_parts.append(clean_ln)
 

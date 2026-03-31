@@ -104,6 +104,13 @@ def _convert_dob(dob: str) -> str:
 def _find_label_value(lines: List[str], label: str) -> str:
 
     label_re = re.compile(label, re.I)
+    # Build regex to split at table label boundaries.
+    # OCR may crop first 1-2 chars of bold labels (e.g. "Father Name" → "ather Name"),
+    # so we match both full and truncated forms.
+    _table_label_pattern = (
+        r'\b(?:[Ii]?d\s*number|[Nn]?ame|[Dd]?ob|[Ff]?ather\s*[Nn]?ame'
+        r'|[Gg]?ender|[Pp]?incode|[Aa]?ddress|[Mm]?obile)\b'
+    )
 
     for i, line in enumerate(lines):
 
@@ -116,19 +123,32 @@ def _find_label_value(lines: List[str], label: str) -> str:
             if m:
                 val = _clean(m.group(1))
                 if val:
-                    return val
+                    # If value has a table label merged in, take portion before it
+                    parts = re.split(_table_label_pattern, val, flags=re.I)
+                    val = parts[0].strip(' ,|')
+                    if val:
+                        return val
 
             # next line
             if i + 1 < len(lines):
                 val = _clean(lines[i+1])
-                if val and not re.search('|'.join(_TABLE_LABELS), val, re.I):
-                    return val
+                if val:
+                    # If next line contains a table label, extract portion before it
+                    if re.search(_table_label_pattern, val, re.I):
+                        parts = re.split(_table_label_pattern, val, flags=re.I)
+                        val = parts[0].strip(' ,|')
+                    if val:
+                        return val
 
             # second next line
             if i + 2 < len(lines):
                 val = _clean(lines[i+2])
-                if val and not re.search('|'.join(_TABLE_LABELS), val, re.I):
-                    return val
+                if val:
+                    if re.search(_table_label_pattern, val, re.I):
+                        parts = re.split(_table_label_pattern, val, flags=re.I)
+                        val = parts[0].strip(' ,|')
+                    if val:
+                        return val
 
     return ""
 
@@ -172,7 +192,8 @@ def _convert_numeric_date(m: re.Match) -> str:
 
 def _extract_dob(lines: List[str], text: str) -> str:
 
-    dob_val = _find_label_value(lines, r'\bDob\b')
+    # OCR may crop first char: "Dob" → "ob"
+    dob_val = _find_label_value(lines, r'\b[Dd]?ob\b')
 
     print(f"[DEBUG DOB] raw dob_val from label = {repr(dob_val)}")
 
@@ -209,8 +230,9 @@ def _extract_dob(lines: List[str], text: str) -> str:
 
 def _extract_name(lines: List[str], text: str) -> str:
 
+    # OCR may crop first char: "Customer" → "ustomer"
     m = re.search(
-        r'Customer\s*Name\s*[:\s]+(.+)',
+        r'[Cc]?ustomer\s*[Nn]?ame\s*[:\s]+(.+)',
         text,
         re.I
     )
@@ -218,9 +240,10 @@ def _extract_name(lines: List[str], text: str) -> str:
     if m:
         return _clean(m.group(1))
 
-    name = _find_label_value(lines, r'\bName\b')
+    # OCR may crop first char: "Name" → "ame"
+    name = _find_label_value(lines, r'\b[Nn]?ame\b')
 
-    if name and not re.search(r'Father', name, re.I):
+    if name and not re.search(r'[Ff]?ather', name, re.I):
         return name
 
     return ""
@@ -228,24 +251,66 @@ def _extract_name(lines: List[str], text: str) -> str:
 
 def _extract_father(lines: List[str], text: str) -> str:
 
-    father = _find_label_value(lines, r'Father\s*Name')
+    # OCR often crops first 1-2 chars of bold table labels:
+    #   "Father Name" → "ather Name" or "ther Name"
+    # So we use flexible patterns that match both full and truncated labels.
+    _father_label = r'[Ff]?ather\s*[Nn]?ame'
+    _trailing_labels = r'\b(?:[Gg]?ender|[Mm]ale|[Ff]emale|[Tt]ransgender|[Pp]?incode|[Aa]?ddress|[Dd]?ob|[Ii]?d\s*number|[Mm]?obile)\b'
+
+    father = _find_label_value(lines, _father_label)
 
     if not father:
-        father = _find_label_value(lines, r'\bFather\b')
+        father = _find_label_value(lines, r'[Ff]?ather\b')
+
+    # Strategy 2: scan lines directly for father label + value
+    # Handles cases where _find_label_value misses due to merged table rows
+    if not father:
+        for i, line in enumerate(lines):
+            m = re.search(
+                _father_label + r'\s*[:\s|]*([A-Za-z][A-Za-z .\-]{2,})',
+                line, re.I
+            )
+            if m:
+                val = m.group(1).strip()
+                # Stop at table labels that may be appended (e.g. "Singh Gender")
+                val = re.split(_trailing_labels, val, flags=re.I)[0].strip()
+                if len(val) >= 3:
+                    father = val
+                    break
+
+    # Strategy 3: look at next line after father label line
+    if not father:
+        for i, line in enumerate(lines):
+            if re.search(_father_label, line, re.I):
+                if i + 1 < len(lines):
+                    val = _clean(lines[i + 1])
+                    # Strip any trailing table label that got merged
+                    val = re.split(_trailing_labels, val, flags=re.I)[0].strip()
+                    if val and len(val) >= 3 and re.match(r'^[A-Za-z .\-]+$', val):
+                        father = val
+                        break
 
     if father:
-
-        if father.upper() in ["MALE","FEMALE","TRANSGENDER"]:
+        # Reject if it's just a gender word
+        if father.upper() in ["MALE", "FEMALE", "TRANSGENDER"]:
             father = ""
+        else:
+            # Clean: keep only letters, spaces, dots, hyphens
+            father = re.sub(r'[^A-Za-z .\-]', '', father).strip()
+            # Remove trailing noise words
+            father = re.sub(r'\s+(Male|Female|Transgender)\s*$', '', father, flags=re.I).strip()
+            if len(father) >= 3:
+                return father
 
-        if re.match(r'^[A-Za-z ]{3,}$', father):
-            return father.strip()
-
-    # fallback extraction from address text
-    m = re.search(r'(?:C/O|S/O|D/O|W/O)\s*[:\-]?\s*([A-Za-z ]{3,})', text, re.I)
+    # Fallback: extract from S/O, C/O, D/O, W/O in address text
+    m = re.search(r'(?:C/O|S/O|D/O|W/O)\s*[:\-]?\s*([A-Za-z][A-Za-z ]{2,})', text, re.I)
 
     if m:
-        return m.group(1).strip()
+        val = m.group(1).strip()
+        # Stop at address parts (comma, digits, etc.)
+        val = re.split(r'[,\d]', val)[0].strip()
+        if len(val) >= 3:
+            return val
 
     return ""
 
@@ -293,13 +358,22 @@ def _is_noise(s: str) -> bool:
     # standalone UUID fragments
     if re.match(r'^[0-9a-f]{8,}[\-0-9a-f]*$', s, re.I) and '-' in s:
         return True
+    # Mobile number line: "Mobile 1234567890", "obile 1234567890", "Iobile ..."
+    if re.match(r'^[MmIi]?obile\s*\d', s, re.I):
+        return True
+    # Standalone phone number (10+ digits)
+    if re.match(r'^\d{10,}$', s.replace(' ', '')):
+        return True
     return False
 
 
 def _is_table_label(s: str) -> bool:
-    """Check if line is a table row label (not address content)."""
+    """Check if line is a table row label (not address content).
+    Handles OCR-truncated labels (e.g. 'ather Name' for 'Father Name').
+    """
     return bool(re.match(
-        r'^(Id\s*number|Name|Dob|Father\s*Name|Gender|Pincode)\b', s, re.I
+        r'^([Ii]?d\s*number|[Nn]?ame|[Dd]?ob|[Ff]?ather\s*[Nn]?ame|[Gg]?ender|[Pp]?incode|[Mm]?obile)\b',
+        s, re.I
     ))
 
 
@@ -308,6 +382,8 @@ def _clean_address(addr: str) -> str:
     # remove leaked "Address" label word (full or partial) anywhere
     addr = re.sub(r'\b[Aa]ddres\w*\b', '', addr)
     addr = re.sub(r'\bddress\b', '', addr, flags=re.I)
+    # remove leaked Mobile number (e.g. "Mobile 8376887112", "obile 123...", "Iobile ...")
+    addr = re.sub(r',?\s*[MmIi]?obile\s*\d[\d\s]*', '', addr, flags=re.I)
     addr = re.sub(r',\s*,', ',', addr)
     addr = re.sub(r'\s+', ' ', addr)
     return addr.strip(" ,")
@@ -368,8 +444,9 @@ def _strategy_after_pincode(lines: List[str]) -> str:
 
     for i, line in enumerate(lines):
         s = _clean_label(line)
-        # "Pincode 202138", "483440 Pincode", or "Pincode" alone
-        if re.search(r'\bPincode\b', s, re.I):
+        # "Pincode 202138", "incode 755026", or "Pincode" alone
+        # OCR may crop first char: "Pincode" → "incode"
+        if re.search(r'\b[Pp]?incode\b', s, re.I):
             pincode_idx = i
             break
 
@@ -380,7 +457,7 @@ def _strategy_after_pincode(lines: List[str]) -> str:
             if re.match(r'^\d{6}$', s):
                 if i > 0:
                     prev = _clean_label(lines[i-1])
-                    if re.search(r'(Gender|Male|Female)', prev, re.I):
+                    if re.search(r'([Gg]?ender|Male|Female)', prev, re.I):
                         pincode_idx = i
                         break
 
@@ -395,14 +472,14 @@ def _strategy_after_pincode(lines: List[str]) -> str:
             if not in_table:
                 continue
             s = _clean_label(line)
-            # line has pincode label word anywhere
-            if re.search(r'pin\s*code', s, re.I):
+            # line has pincode label word anywhere (handles "incode" too)
+            if re.search(r'[Pp]?in\s*code', s, re.I):
                 pincode_idx = i
                 break
             # standalone 6-digit after Gender
             if i > 0 and re.match(r'^\d{6}$', line.strip()):
                 prev = _clean_label(lines[i-1])
-                if re.search(r'(Gender|Male|Female)', prev, re.I):
+                if re.search(r'([Gg]?ender|Male|Female)', prev, re.I):
                     pincode_idx = i
                     break
 
@@ -537,11 +614,14 @@ def is_kyc_report(lines: List[str], text: str) -> bool:
     text_lower = text.lower()
 
     # KYC Report keyword indicators
+    # OCR may crop first char: "Customer" → "ustomer", "KYC" → "YC"
     kyc_markers = [
         'kyc report',
         'kyc status',
         'customer name',
+        'ustomer name',
         'customer identification',
+        'ustomer identification',
         'verification from'
     ]
 
@@ -549,9 +629,10 @@ def is_kyc_report(lines: List[str], text: str) -> bool:
     has_kyc_marker = any(marker in text_lower for marker in kyc_markers)
 
     # Check for KYC report table structure
+    # OCR may truncate labels: "id number" → "l number", "gender" → "ender"
     has_table_labels = all(
-        label in text_lower
-        for label in ['id number', 'name', 'dob', 'gender']
+        re.search(pattern, text_lower)
+        for pattern in [r'(?:id\s*)?number', r'(?:n)?ame', r'(?:d)?ob', r'(?:g)?ender']
     )
 
     # If both KYC indicators found, it's likely a KYC report
