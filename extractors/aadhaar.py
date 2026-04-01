@@ -909,10 +909,44 @@ def _clean_address_token(token: str) -> str:
     if len(token) == 1 and token.islower():
         return ""
 
+    # Remove short mixed-case/digit tokens that are garbage from bilingual OCR merge
+    # e.g. "1s", "Is" (when not a real word in address context)
+    if len(token) == 2 and re.search(r'\d', token) and re.search(r'[a-zA-Z]', token):
+        return ""
+
     # Remove tokens that mix digits and uppercase letters in garbage patterns
     # e.g. "3ITETT", "5HRTT" but NOT "A-202" or "401203"
     if re.match(r'^\d+[A-Z]{2,}$', token) or re.match(r'^[A-Z]+\d+[A-Z]+$', token):
         return ""
+
+    # Remove tokens that mix lowercase letters and digits in garbage patterns
+    # e.g. "12sbjlalle", "it2", "Plt2c" — transliteration artifacts from Hindi/Marathi
+    # Real address tokens with digits are house numbers (A-202, No.22) or PIN codes (already handled above)
+    if re.search(r'\d', token) and re.search(r'[a-z]', token):
+        # Allow known patterns like "No22", "Sector1" etc.
+        if not re.match(r'^(No|Sector|Ward|Plot|Block|Phase|Floor|Flat)\s*\.?\s*\d+$', token, re.I):
+            return ""
+
+    # Remove pure lowercase gibberish tokens (transliteration artifacts)
+    # e.g. "jlaede", "lnllef", "elhih", "lie" — from Hindi/Marathi OCR bleed
+    # In address context, real English words are either:
+    #   - Capitalized proper nouns (place names): "Wardha", "Maharashtra"
+    #   - Known common address words: "near", "behind", "post", "dist", "village"
+    # Pure lowercase tokens that aren't recognized address words are garbage
+    if token.islower() and len(token) >= 2:
+        # Known lowercase address words that are valid
+        valid_address_words = {
+            'at', 'po', 'to', 'of', 'in', 'on', 'no', 'nr', 'via', 'opp',
+            'tal', 'tah', 'tab', 'div', 'moh', 'dist', 'post', 'near',
+            'behind', 'opposite', 'beside', 'above', 'below', 'next',
+            'road', 'street', 'lane', 'nagar', 'colony', 'village',
+            'house', 'flat', 'floor', 'block', 'sector', 'ward',
+            'plot', 'building', 'complex', 'chowk', 'bazar', 'market',
+            'city', 'town', 'state', 'pin', 'cross', 'main', 'old', 'new',
+            'east', 'west', 'north', 'south', 'central',
+        }
+        if token not in valid_address_words:
+            return ""
 
     return token
 
@@ -1018,6 +1052,12 @@ def _clean_and_deduplicate_address(address_parts: List[str], person_name: str = 
         # Remove standalone 2-letter fragments with digits that look like OCR garbage
         if len(alpha_only) == 2 and len(comp) <= 4 and re.search(r'\d', comp):
             continue
+        # Remove standalone short (2-3 letter) components that aren't valid address words
+        # e.g. "Is", "li", "Os" — leftover garbage from bilingual OCR merge
+        if len(alpha_only) <= 3 and len(comp) <= 4:
+            valid_short = {'at', 'po', 'to', 'of', 'no', 'nr', 'rd', 'st', 'so', 'do', 'via', 'opp', 'tal', 'tah', 'tab', 'div', 'moh'}
+            if alpha_only.lower() not in valid_short:
+                continue
         # Remove fragments that look like garbled relation markers (O/s, S/0, etc.)
         if re.match(r'^[A-Za-z]/[a-z]\b', comp) and not re.match(r'^(S/O|D/O|W/O|C/O)\b', comp, re.I):
             continue
