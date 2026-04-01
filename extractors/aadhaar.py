@@ -190,6 +190,16 @@ def extract_aadhaar(lines: List[str], text: str, records: List[Dict]) -> Dict:
     print(f"[DEBUG] Husband: {obj['husband_name']}")
 
     # =========================================================================
+    # STEP 6b: Cross-validate name using relation surname (full e-Aadhaar fix)
+    # =========================================================================
+    print("\n[DEBUG] === Cross-validating Name with Relation Surname ===")
+    obj['name'] = cross_validate_name_with_relation(
+        obj['name'], obj['father_name'], obj['mother_name'], obj['husband_name'],
+        lines, records
+    )
+    print(f"[DEBUG] Name (after cross-validation): {obj['name']}")
+
+    # =========================================================================
     # STEP 7: Extract Address
     # =========================================================================
     print("\n[DEBUG] === Extracting Address ===")
@@ -492,6 +502,34 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
         return text.strip()
 
     # -------------------------------------------------------------------------
+    # Strategy 0: Full e-Aadhaar mini-card format
+    # In full e-Aadhaar (letter with embedded mini cards), the bottom-left card
+    # has: "Name\nDate of Birth/DOB: DD/MM/YYYY\nMale/ MALE"
+    # This is very reliable because the "Date of Birth/DOB:" pattern is unique
+    # to this format (regular front cards just say "DOB:")
+    # -------------------------------------------------------------------------
+    print("[DEBUG] Strategy 0: Looking for name before 'Date of Birth/DOB:' (full e-Aadhaar)...")
+    for i, ln in enumerate(lines):
+        if re.search(r'Date\s*of\s*Birth\s*/?\s*DOB\s*:', ln, re.I):
+            # Found the full "Date of Birth/DOB:" pattern - check lines above for name
+            for k in range(i - 1, max(0, i - 4), -1):
+                candidate = lines[k].strip()
+
+                # Skip blank, Devanagari-only, or boilerplate lines
+                if not candidate:
+                    continue
+                if contains_devanagari(candidate) and not extract_english_only(candidate).strip():
+                    continue
+
+                english_text = extract_english_only(candidate)
+                if is_valid_name_candidate(english_text):
+                    name = clean_name(english_text)
+                    if name and len(name) >= 5:
+                        print(f"[DEBUG] Found name before 'Date of Birth/DOB:': '{name}'")
+                        return name
+            break  # Only use first occurrence of this pattern
+
+    # -------------------------------------------------------------------------
     # Strategy 1: Find English name after Hindi (Devanagari) name
     # This is the most reliable pattern for Aadhaar cards
     # Also handles merged lines where Hindi+English name are on same line
@@ -671,6 +709,86 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
 
     print("[DEBUG] No name found!")
     return ""
+
+
+def cross_validate_name_with_relation(
+    name: str, father: str, mother: str, husband: str,
+    lines: List[str], records: List[Dict]
+) -> str:
+    """Cross-validate extracted name using relation name's surname.
+
+    In full e-Aadhaar format, OCR sometimes picks up garbage text as the name
+    (e.g., "FIBLIE ADHAAR" instead of "Saksham Limje"). If the extracted name
+    doesn't share a surname with the relation (father/husband), search for a
+    better candidate that does.
+
+    Only triggers when:
+    - A relation name (father/husband) is found with a clear surname
+    - The current name does NOT share that surname
+    """
+    # Determine the reference surname from relation names
+    relation_name = father or husband
+    if not relation_name:
+        return name
+
+    relation_parts = relation_name.strip().split()
+    if len(relation_parts) < 2:
+        return name
+
+    surname = relation_parts[-1].lower()
+
+    # Check if current name already shares the surname
+    if name:
+        name_parts = name.strip().split()
+        if any(p.lower() == surname for p in name_parts):
+            return name
+
+    # Current name doesn't share surname - look for a better candidate
+    # Search lines for a title-case or all-caps name that shares the surname
+    print(f"[DEBUG] Cross-validation: name '{name}' doesn't match surname '{surname}', searching...")
+
+    skip_patterns = [
+        'government', 'india', 'aadhaar', 'uidai', 'unique', 'identification',
+        'authority', 'enrolment', 'enrollment', 'address', 'help@', 'www.',
+        'mera', 'meri', 'pahchan', 'signature', 'valid'
+    ]
+
+    best_candidate = None
+    for ln in lines:
+        # Skip boilerplate
+        if any(p in ln.lower() for p in skip_patterns):
+            continue
+        # Skip relation marker lines (these contain the father/husband name, not person name)
+        if re.search(r'\b(S/O|D/O|W/O|C/O|SON\s*OF|DAUGHTER\s*OF|WIFE\s*OF)\b', ln, re.I):
+            continue
+        # Skip lines with digits
+        if re.search(r'\d', ln):
+            continue
+
+        english_text = extract_english_only(ln).strip()
+        if not english_text or len(english_text) < 5:
+            continue
+
+        words = english_text.split()
+        if len(words) < 2 or len(words) > 4:
+            continue
+
+        # Check if this candidate shares the surname
+        if any(w.lower() == surname for w in words):
+            # Validate it looks like a name
+            if has_reasonable_vowel_ratio(english_text) and not is_likely_garbage(english_text):
+                # Prefer title case names
+                if all(w[0].isupper() for w in words if w.isalpha()):
+                    candidate = clean_ocr_garbage(english_text)
+                    if candidate and len(candidate) >= 5:
+                        if best_candidate is None or is_title_case_name(candidate):
+                            best_candidate = candidate
+
+    if best_candidate:
+        print(f"[DEBUG] Cross-validation found better name: '{best_candidate}'")
+        return best_candidate
+
+    return name
 
 
 def extract_relation_names(lines: List[str], person_name: str) -> Tuple[str, str, str]:
@@ -1186,3 +1304,4 @@ def extract_address(lines: List[str], person_name: str) -> str:
         return _clean_and_deduplicate_address(address_parts, person_name)
 
     return ""
+
