@@ -501,7 +501,8 @@ def merge_results(results: List[Dict]) -> List[Dict]:
         ordered.append({
             'text': merged_text,
             'conf': avg_conf,
-            'y': b
+            'y': b,
+            'items': items_sorted,  # preserve individual OCR boxes with x positions
         })
 
     # Merge tiny fragments
@@ -512,10 +513,12 @@ def merge_results(results: List[Dict]) -> List[Dict]:
         if buffer and len(buffer['text']) < 8 and re.match(r'^[A-Za-z]+$', ln.replace(' ', '')):
             buffer['text'] = buffer['text'] + ' ' + ln
             buffer['conf'] = max(buffer.get('conf', 0.0), rec.get('conf', 0.0))
+            buffer.setdefault('items', []).extend(rec.get('items', []))
         else:
             if buffer:
                 merged.append(buffer)
-            buffer = dict(text=ln, conf=rec.get('conf', 0.0), y=rec.get('y', 0))
+            buffer = dict(text=ln, conf=rec.get('conf', 0.0), y=rec.get('y', 0),
+                          items=rec.get('items', []))
     if buffer:
         merged.append(buffer)
 

@@ -53,6 +53,111 @@ def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
     return False
 
 
+def _filter_english_column(lines: List[str], records: List[Dict]) -> List[str]:
+    """Filter OCR lines to keep only the English column on bilingual Aadhaar back.
+
+    Aadhaar back side has 2-column layout: one Hindi, one English.
+    The English column can be on EITHER side (left or right).
+    PaddleOCR (lang='en') misreads Hindi as ASCII garbage.
+
+    This function:
+    1. Finds the "Address:" label to identify the English column
+    2. Detects 2-column layout by analyzing x-position clusters
+    3. Keeps only items from the English column
+    """
+    if not records:
+        return lines
+
+    # Check if records have 'items' (individual OCR boxes with x-positions)
+    has_items = any(r.get('items') for r in records)
+    if not has_items:
+        return lines
+
+    # Find the "Address:" label's x-position
+    addr_x = -1
+    addr_y = -1
+    for rec in records:
+        for item in rec.get('items', []):
+            if re.search(r'\bAddress\s*:', item.get('text', ''), re.I):
+                addr_x = item.get('x', -1)
+                addr_y = rec.get('y', -1)
+                break
+        if addr_x >= 0:
+            break
+
+    if addr_x < 0:
+        return lines
+
+    # Collect x-positions from items in the address region only
+    # (between Address: label and ~400px below, to avoid Aadhaar number/boilerplate)
+    addr_region_items_x = []
+    for rec in records:
+        rec_y = rec.get('y', 0)
+        if rec_y < addr_y - 20 or rec_y > addr_y + 400:
+            continue  # Only consider the address block
+        for item in rec.get('items', []):
+            addr_region_items_x.append(item.get('x', 0))
+
+    if not addr_region_items_x:
+        return lines
+
+    min_x = min(addr_region_items_x)
+    max_x = max(addr_region_items_x)
+    x_range = max_x - min_x
+
+    # If x range is too small, it's likely a single-column or stacked layout — no filtering needed
+    if x_range < 200:
+        logger.debug(f"Column filter: x_range={x_range} too small, no column split detected")
+        return lines
+
+    # Detect column boundary: find the biggest gap in sorted x-positions
+    sorted_x = sorted(set(addr_region_items_x))
+    best_gap = 0
+    best_boundary = -1
+    for i in range(len(sorted_x) - 1):
+        gap = sorted_x[i + 1] - sorted_x[i]
+        if gap > best_gap:
+            best_gap = gap
+            best_boundary = (sorted_x[i] + sorted_x[i + 1]) // 2
+
+    # Only filter if there's a clear column gap (at least 150px absolute)
+    if best_gap < 150:
+        logger.debug(f"Column filter: best_gap={best_gap} < 150px, no clear columns")
+        return lines
+
+    logger.debug(f"Column filter: Address at x={addr_x}, column boundary={best_boundary}, gap={best_gap}")
+
+    # Determine which side of the boundary the English column is on
+    english_is_left = addr_x < best_boundary
+
+    logger.debug(f"Column filter: English column is {'LEFT' if english_is_left else 'RIGHT'}")
+
+    # Rebuild lines using only English column items
+    margin = 30  # tolerance in pixels
+    filtered_lines = []
+    for rec in records:
+        items = rec.get('items', [])
+        if not items:
+            filtered_lines.append(rec.get('text', ''))
+            continue
+
+        if english_is_left:
+            keep_items = [item for item in items if item.get('x', 0) < best_boundary + margin]
+        else:
+            keep_items = [item for item in items if item.get('x', 0) >= best_boundary - margin]
+
+        if keep_items:
+            keep_items.sort(key=lambda it: it.get('x', 0))
+            filtered_text = ' '.join(item['text'] for item in keep_items)
+            filtered_lines.append(filtered_text)
+
+    logger.debug(f"Column filter: {len(lines)} lines -> {len(filtered_lines)} filtered lines")
+    for i, ln in enumerate(filtered_lines[:15]):
+        logger.debug(f"  Filtered line {i}: '{ln}'")
+
+    return filtered_lines
+
+
 def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Dict:
     """Extract data from Aadhaar card back side.
 
@@ -91,8 +196,14 @@ def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Di
     obj['vid'] = extract_vid(text, lines)
     logger.debug(f"VID: {obj['vid']}")
 
-    # Extract address (use existing logic - works well with clean left-column text)
-    obj['address'] = extract_address(lines, "")
+    # Build column-filtered lines for address extraction.
+    # Aadhaar back side often has 2 columns: Hindi (left) + English (right).
+    # PaddleOCR with lang='en' misreads Hindi as ASCII garbage.
+    # Use individual OCR box x-positions to keep only the right (English) column.
+    addr_lines = _filter_english_column(lines, records)
+
+    # Extract address using column-filtered lines
+    obj['address'] = extract_address(addr_lines, "")
     logger.debug(f"Address: {obj['address'][:100]}..." if len(obj['address']) > 100 else f"Address: {obj['address']}")
 
     # Back side: relation names are part of the address (S/O, D/O etc.)
@@ -915,8 +1026,14 @@ def _clean_address_token(token: str) -> str:
         return ""
 
     # Remove tokens that mix digits and uppercase letters in garbage patterns
-    # e.g. "3ITETT", "5HRTT" but NOT "A-202" or "401203"
+    # e.g. "3ITETT", "5HRTT", "4R46" but NOT "A-202" or "401203"
+    # Note: valid house numbers (A-202, B101) are already handled above
     if re.match(r'^\d+[A-Z]{2,}$', token) or re.match(r'^[A-Z]+\d+[A-Z]+$', token):
+        return ""
+    # Catch remaining digit+uppercase mixes like "4R46" (digit-letter-digit patterns)
+    if re.search(r'\d', token) and re.search(r'[A-Z]', token) and not re.search(r'[a-z]', token):
+        # This token has digits and uppercase but no lowercase — likely garbage
+        # Valid patterns (A-202, B101) were already returned above
         return ""
 
     # Remove tokens that mix lowercase letters and digits in garbage patterns
@@ -924,8 +1041,27 @@ def _clean_address_token(token: str) -> str:
     # Real address tokens with digits are house numbers (A-202, No.22) or PIN codes (already handled above)
     if re.search(r'\d', token) and re.search(r'[a-z]', token):
         # Allow known patterns like "No22", "Sector1" etc.
-        if not re.match(r'^(No|Sector|Ward|Plot|Block|Phase|Floor|Flat)\s*\.?\s*\d+$', token, re.I):
+        if not re.match(r'^(No|Sector|Ward|Plot|Block|Phase|Floor|Flat)\s*[\.\-]?\s*\d+$', token, re.I):
             return ""
+
+    # Remove tokens with abnormal casing patterns (Hindi OCR garbage)
+    # Valid English address words are: Title Case ("Nagpur"), ALL CAPS ("S/O"), or lowercase ("road")
+    # Garbage patterns: "dcST", "PadOG", "oOye", "PadcloiG" - lowercase followed by uppercase mid-word
+    if len(token) >= 3 and re.search(r'[a-z][A-Z]', token):
+        # Allow known patterns like "McDonald" or abbreviations in camelCase won't appear in addresses
+        return ""
+
+    # Remove ALL CAPS tokens that have excessive consonants (Hindi OCR garbage like "SIOTHGT", "HERTOE")
+    # Valid all-caps address tokens are short abbreviations (S/O, CO) or state names
+    if token.isupper() and len(token) >= 5:
+        alpha_only = re.sub(r'[^A-Z]', '', token)
+        if alpha_only:
+            vowels = sum(1 for c in alpha_only if c in 'AEIOUY')
+            consonants = len(alpha_only) - vowels
+            # Real words have vowel ratio >= 30%; garbage like SIOTHGT (28%) or HERTOE are suspect
+            # Also check for unusual consonant clusters
+            if re.search(r'[BCDFGHJKLMNPQRSTVWXZ]{3,}', alpha_only):
+                return ""
 
     # Remove pure lowercase gibberish tokens (transliteration artifacts)
     # e.g. "jlaede", "lnllef", "elhih", "lie" — from Hindi/Marathi OCR bleed
@@ -1012,8 +1148,12 @@ def _clean_and_deduplicate_address(address_parts: List[str], person_name: str = 
     for p in filtered:
         for comp in p.split(','):
             comp = comp.strip().strip(',-.:')
-            if comp:
-                all_components.append(comp)
+            if not comp:
+                continue
+            # Filter out person name at component level too
+            if person_name and comp.upper().strip() == person_name.upper().strip():
+                continue
+            all_components.append(comp)
 
     # Deduplicate at the component level
     def normalize(s):
@@ -1046,6 +1186,14 @@ def _clean_and_deduplicate_address(address_parts: List[str], person_name: str = 
     for comp in all_components:
         # Remove very short garbage fragments (e.g. "g", "a", "ON 3")
         # but keep legitimate short components like "No 22" when part of larger context
+        # Also keep PIN codes (6-digit numbers) and house numbers (A-202, B 101, etc.)
+        if re.match(r'^\d{6}$', comp.strip()):
+            cleaned_components.append(comp)
+            continue
+        # Keep house number patterns: single letter + digits (A-202, A 202, B-101)
+        if re.match(r'^[A-Za-z]\s*[-\s]?\s*\d{1,4}$', comp.strip()):
+            cleaned_components.append(comp)
+            continue
         alpha_only = re.sub(r'[^a-zA-Z]', '', comp)
         if len(alpha_only) < 2:
             continue
@@ -1268,7 +1416,9 @@ def extract_address(lines: List[str], person_name: str) -> str:
                     continue
 
                 # Skip the person's name if seen right after "To"
-                if person_name and clean_line.upper() == person_name.upper():
+                # Use contains check to handle garbage prefixes (e.g. "4R46 PAYAL LAXMAN BISANE")
+                if person_name and (clean_line.upper() == person_name.upper()
+                                    or person_name.upper() in clean_line.upper()):
                     name_found = True
                     continue
                 
