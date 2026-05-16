@@ -1,7 +1,5 @@
 import re
 from typing import Dict, List, Optional
-from logging_config import get_logger
-logger = get_logger("kyc_report")
 
 
 _TABLE_LABELS = [
@@ -197,25 +195,25 @@ def _extract_dob(lines: List[str], text: str) -> str:
     # OCR may crop first char: "Dob" → "ob"
     dob_val = _find_label_value(lines, r'\b[Dd]?ob\b')
 
-    logger.debug(f"raw dob_val from label = {repr(dob_val)}")
+    print(f"[DEBUG DOB] raw dob_val from label = {repr(dob_val)}")
 
     if dob_val:
         # First try text-based month name (e.g. "31st Jan 2008")
         dob = _convert_dob(dob_val)
-        logger.debug(f"_convert_dob({repr(dob_val)}) = {repr(dob)}")
+        print(f"[DEBUG DOB] _convert_dob({repr(dob_val)}) = {repr(dob)}")
         if dob:
             return dob
         # Then try numeric format directly in the fetched value
         m_num = re.search(_NUMERIC_DATE_PATTERN, dob_val)
         if m_num:
             result = _convert_numeric_date(m_num)
-            logger.debug(f"numeric match in dob_val => {repr(result)}")
+            print(f"[DEBUG DOB] numeric match in dob_val => {repr(result)}")
             return result
 
     # Fallback: text-based date in full text (e.g. "31st Jan 2008")
     m = re.search(DATE_PATTERN, text)
     if m:
-        logger.debug(f"DATE_PATTERN matched in full text: {repr(m.group())}")
+        print(f"[DEBUG DOB] DATE_PATTERN matched in full text: {repr(m.group())}")
         dob = _convert_dob(m.group())
         if dob:
             return dob
@@ -224,7 +222,7 @@ def _extract_dob(lines: List[str], text: str) -> str:
     m_num = re.search(_NUMERIC_DATE_PATTERN, text)
     if m_num:
         result = _convert_numeric_date(m_num)
-        logger.debug(f"numeric fallback in full text => {repr(result)}")
+        print(f"[DEBUG DOB] numeric fallback in full text => {repr(result)}")
         return result
 
     return ""
@@ -399,37 +397,37 @@ def _extract_address(lines: List[str], name: str, father: str,
     OCR may split multi-line addresses or reorder label vs value.
     """
 
-    logger.debug("===== Address Extraction =====")
-    logger.debug(f"Lines ({len(lines)}):")
+    print("\n[DEBUG] ===== Address Extraction =====")
+    print(f"[DEBUG] Lines ({len(lines)}):")
     for i, ln in enumerate(lines):
-        logger.debug(f"  {i}: '{ln}'")
+        print(f"[DEBUG]   {i}: '{ln}'")
 
     # Strategy 1 (after Pincode) is most reliable: Address is always last
     # row in KYC table, and Pincode is always just above it.
     addr = _strategy_after_pincode(lines)
     if addr and len(addr) > 10:
-        logger.debug(f"Strategy 1 (after Pincode) => '{addr}'")
+        print(f"[DEBUG] Strategy 1 (after Pincode) => '{addr}'")
         return addr
 
     # Fallback: find "Address" label in lines
     addr = _strategy_address_label(lines)
     if addr and len(addr) > 10:
-        logger.debug(f"Strategy 2 (Address label) => '{addr}'")
+        print(f"[DEBUG] Strategy 2 (Address label) => '{addr}'")
         return addr
 
     # Fallback: regex S/O, C/O, D/O, W/O in full text
     addr = _strategy_care_of_regex("\n".join(lines))
     if addr and len(addr) > 10:
-        logger.debug(f"Strategy 3 (C/O regex) => '{addr}'")
+        print(f"[DEBUG] Strategy 3 (C/O regex) => '{addr}'")
         return addr
 
     # Last resort: collect comma-heavy lines after table
     addr = _strategy_comma_lines(lines)
     if addr and len(addr) > 10:
-        logger.debug(f"Strategy 4 (comma lines) => '{addr}'")
+        print(f"[DEBUG] Strategy 4 (comma lines) => '{addr}'")
         return addr
 
-    logger.debug("All strategies failed for address")
+    print("[DEBUG] All strategies failed for address")
     return ""
 
 
