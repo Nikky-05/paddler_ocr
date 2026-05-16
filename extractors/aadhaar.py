@@ -18,8 +18,32 @@ from .utils import (
     looks_like_uidai_text, is_likely_garbage, has_reasonable_vowel_ratio,
     extract_english_only, validate_verhoeff
 )
-from logging_config import get_logger
-logger = get_logger("aadhaar")
+import logging
+logger = logging.getLogger("aadhaar")
+
+
+def _contains_indic_script(text: str) -> bool:
+    """Check if text contains any Indic script character.
+
+    Covers all major Indian scripts found on Aadhaar cards:
+    Devanagari (Hindi/Marathi), Telugu, Tamil, Odia, Bengali,
+    Gurmukhi, Gujarati, Kannada, Malayalam.
+    """
+    if not text:
+        return False
+    for char in text:
+        cp = ord(char)
+        if (0x0900 <= cp <= 0x097F or  # Devanagari
+                0x0980 <= cp <= 0x09FF or  # Bengali/Assamese
+                0x0A00 <= cp <= 0x0A7F or  # Gurmukhi (Punjabi)
+                0x0A80 <= cp <= 0x0AFF or  # Gujarati
+                0x0B00 <= cp <= 0x0B7F or  # Odia
+                0x0B80 <= cp <= 0x0BFF or  # Tamil
+                0x0C00 <= cp <= 0x0C7F or  # Telugu
+                0x0C80 <= cp <= 0x0CFF or  # Kannada
+                0x0D00 <= cp <= 0x0D7F):   # Malayalam
+            return True
+    return False
 
 
 def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
@@ -212,6 +236,12 @@ def extract_aadhaar(lines: List[str], text: str, records: List[Dict]) -> Dict:
 
 def extract_aadhaar_number(text: str, lines: List[str]) -> str:
     """Extract 12-digit Aadhaar number with Verhoeff validation."""
+
+    # Pattern 0: Masked e-Aadhaar format "XXXX XXXX 9420" (last 4 digits visible)
+    # This is the standard format for e-Aadhaar PDFs downloaded from UIDAI
+    masked_match = re.search(r'\bXXXX\s+XXXX\s+(\d{4})\b', text)
+    if masked_match:
+        return f"XXXX XXXX {masked_match.group(1)}"
 
     candidates = []
 
@@ -492,34 +522,38 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
         return text.strip()
 
     # -------------------------------------------------------------------------
-    # Strategy 1: Find English name after Hindi (Devanagari) name
+    # Strategy 1: Find English name after regional script name
     # This is the most reliable pattern for Aadhaar cards
-    # Also handles merged lines where Hindi+English name are on same line
+    # Also handles merged lines where regional+English name are on same line
+    # Covers all Indian scripts: Devanagari, Telugu, Tamil, Odia, etc.
     # -------------------------------------------------------------------------
-    print("[DEBUG] Strategy 1: Looking for English name after Hindi name...")
+    print("[DEBUG] Strategy 1: Looking for English name after regional script name...")
     for i in range(len(lines)):
-        if contains_devanagari(lines[i]):
-            # First: check if this line has BOTH Devanagari AND English name
+        if _contains_indic_script(lines[i]):
+            # First: check if this line has BOTH regional script AND English name
             # (OCR may merge "आशा लक्ष्मन बिसाने ASHA LAXMAN BISANE" into one line)
+            # Exclude gender lines like "స్త్రీ/ FEMALE" which have Indic + English gender word
             english_part = extract_english_only(lines[i])
-            if english_part and is_valid_name_candidate(english_part):
+            if (english_part
+                    and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_part, re.I)
+                    and is_valid_name_candidate(english_part)):
                 name = clean_name(english_part)
                 if name and len(name) >= 5:
-                    print(f"[DEBUG] Found name in merged Devanagari+English line: '{name}'")
+                    print(f"[DEBUG] Found name in merged regional+English line: '{name}'")
                     return name
 
             # Then: check next few lines for English name
             for j in range(i + 1, min(i + 3, len(lines))):
                 next_ln = lines[j].strip()
 
-                # Skip if this line also has Devanagari
-                if contains_devanagari(next_ln):
+                # Skip if this line also has any Indic script
+                if _contains_indic_script(next_ln):
                     continue
 
                 # Skip if it's a DOB or gender line
                 if re.search(r'\bDOB\b|जन्म|तिथि|\d{2}/\d{2}/\d{4}', next_ln, re.I):
                     continue
-                if re.search(r'\b(MALE|FEMALE)\b', next_ln, re.I):
+                if re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', next_ln, re.I):
                     continue
 
                 # Check if it looks like a name
@@ -527,8 +561,23 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 if is_valid_name_candidate(english_text):
                     name = clean_name(english_text)
                     if name and len(name) >= 5:
-                        print(f"[DEBUG] Found name via Devanagari anchor: '{name}'")
+                        print(f"[DEBUG] Found name via regional anchor: '{name}'")
                         return name
+                # Lighter fallback: Indian names like "Lakshmi" have consonant clusters
+                # (KSHM) that is_likely_garbage incorrectly flags. Use direct check here
+                # since we have strong anchor (Indic script on previous line).
+                elif english_text and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_text, re.I):
+                    s1_words = english_text.split()
+                    if (2 <= len(s1_words) <= 5
+                            and not re.search(r'\d', english_text)
+                            and not any(p in english_text.lower() for p in skip_patterns)
+                            and has_reasonable_vowel_ratio(english_text)
+                            and not looks_like_address(english_text)
+                            and all(len(w) >= 2 and (w[0].isupper() or w.isupper()) for w in s1_words)):
+                        name = clean_name(english_text)
+                        if name and len(name) >= 5:
+                            print(f"[DEBUG] Found name via regional anchor (lighter check): '{name}'")
+                            return name
 
     # -------------------------------------------------------------------------
     # Strategy 2: Find name in "To" block (e-Aadhaar format)
@@ -545,13 +594,13 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 # Remove "To" prefix if on same line
                 candidate = re.sub(r'^To\s+', '', candidate, flags=re.I)
 
-                # Skip Devanagari lines (often the Hindi name)
-                if contains_devanagari(candidate):
+                # Skip regional script lines (Devanagari, Telugu, Tamil, Odia, etc.)
+                if _contains_indic_script(candidate):
                     continue
 
                 # Extract English
                 english_text = extract_english_only(candidate)
-                
+
                 # Skip if looks like address (has locality/area keywords)
                 address_keywords = ['nagar', 'village', 'road', 'street', 'lane', 'sector',
                                    'colony', 'house', 'flat', 'building', 'block', 'side',
@@ -559,10 +608,21 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 if any(kw in english_text.lower() for kw in address_keywords):
                     print(f"[DEBUG] Skipping address-like line: '{english_text}'")
                     continue
-                
-                if is_valid_name_candidate(english_text):
+
+                # In the To-block we have a strong positional anchor (right after "To"
+                # + skipped all Indic script lines). Use a lighter check here instead of
+                # is_valid_name_candidate, which calls is_likely_garbage and incorrectly
+                # rejects common Indian names with consonant clusters (e.g., Lakshmi→KSHM).
+                to_words = english_text.split()
+                if (1 <= len(to_words) <= 5
+                        and not re.search(r'\d', english_text)
+                        and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_text, re.I)
+                        and not any(p in english_text.lower() for p in skip_patterns)
+                        and has_reasonable_vowel_ratio(english_text)
+                        and all(len(w) >= 2 and (w[0].isupper() or w.isupper()) for w in to_words)):
                     name = clean_name(english_text)
-                    if name and len(name) >= 5:
+                    min_len = 3 if len(to_words) == 1 else 5
+                    if name and len(name) >= min_len:
                         print(f"[DEBUG] Found name in 'To' block: '{name}'")
                         return name
 
@@ -1055,11 +1115,11 @@ def extract_address(lines: List[str], person_name: str) -> str:
             if re.search(r'\b\d{4}\s+\d{4}\s+\d{4}\b', ln) or re.search(r'\b\d{12}\b', ln):
                 break
 
-            # 1c. Skip purely Devanagari lines (Hindi/Marathi text on back side)
+            # 1c. Skip purely regional script lines (Hindi/Marathi/Telugu/Tamil/Odia etc.)
             english_content = extract_english_only(ln).strip()
             # Remove just digits and punctuation to check if any real English words remain
             english_words_only = re.sub(r'[^a-zA-Z\s]', '', english_content).strip()
-            if contains_devanagari(ln) and len(english_words_only) < 3:
+            if _contains_indic_script(ln) and len(english_words_only) < 3:
                 continue
 
             # 2. Clean merged boilerplate from line instead of skipping
