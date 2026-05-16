@@ -18,8 +18,32 @@ from .utils import (
     looks_like_uidai_text, is_likely_garbage, has_reasonable_vowel_ratio,
     extract_english_only, validate_verhoeff
 )
-from logging_config import get_logger
-logger = get_logger("aadhaar")
+import logging
+logger = logging.getLogger("aadhaar")
+
+
+def _contains_indic_script(text: str) -> bool:
+    """Check if text contains any Indic script character.
+
+    Covers all major Indian scripts found on Aadhaar cards:
+    Devanagari (Hindi/Marathi), Telugu, Tamil, Odia, Bengali,
+    Gurmukhi, Gujarati, Kannada, Malayalam.
+    """
+    if not text:
+        return False
+    for char in text:
+        cp = ord(char)
+        if (0x0900 <= cp <= 0x097F or  # Devanagari
+                0x0980 <= cp <= 0x09FF or  # Bengali/Assamese
+                0x0A00 <= cp <= 0x0A7F or  # Gurmukhi (Punjabi)
+                0x0A80 <= cp <= 0x0AFF or  # Gujarati
+                0x0B00 <= cp <= 0x0B7F or  # Odia
+                0x0B80 <= cp <= 0x0BFF or  # Tamil
+                0x0C00 <= cp <= 0x0C7F or  # Telugu
+                0x0C80 <= cp <= 0x0CFF or  # Kannada
+                0x0D00 <= cp <= 0x0D7F):   # Malayalam
+            return True
+    return False
 
 
 def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
@@ -51,111 +75,6 @@ def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
         return True
 
     return False
-
-
-def _filter_english_column(lines: List[str], records: List[Dict]) -> List[str]:
-    """Filter OCR lines to keep only the English column on bilingual Aadhaar back.
-
-    Aadhaar back side has 2-column layout: one Hindi, one English.
-    The English column can be on EITHER side (left or right).
-    PaddleOCR (lang='en') misreads Hindi as ASCII garbage.
-
-    This function:
-    1. Finds the "Address:" label to identify the English column
-    2. Detects 2-column layout by analyzing x-position clusters
-    3. Keeps only items from the English column
-    """
-    if not records:
-        return lines
-
-    # Check if records have 'items' (individual OCR boxes with x-positions)
-    has_items = any(r.get('items') for r in records)
-    if not has_items:
-        return lines
-
-    # Find the "Address:" label's x-position
-    addr_x = -1
-    addr_y = -1
-    for rec in records:
-        for item in rec.get('items', []):
-            if re.search(r'\bAddress\s*:', item.get('text', ''), re.I):
-                addr_x = item.get('x', -1)
-                addr_y = rec.get('y', -1)
-                break
-        if addr_x >= 0:
-            break
-
-    if addr_x < 0:
-        return lines
-
-    # Collect x-positions from items in the address region only
-    # (between Address: label and ~400px below, to avoid Aadhaar number/boilerplate)
-    addr_region_items_x = []
-    for rec in records:
-        rec_y = rec.get('y', 0)
-        if rec_y < addr_y - 20 or rec_y > addr_y + 400:
-            continue  # Only consider the address block
-        for item in rec.get('items', []):
-            addr_region_items_x.append(item.get('x', 0))
-
-    if not addr_region_items_x:
-        return lines
-
-    min_x = min(addr_region_items_x)
-    max_x = max(addr_region_items_x)
-    x_range = max_x - min_x
-
-    # If x range is too small, it's likely a single-column or stacked layout — no filtering needed
-    if x_range < 200:
-        logger.debug(f"Column filter: x_range={x_range} too small, no column split detected")
-        return lines
-
-    # Detect column boundary: find the biggest gap in sorted x-positions
-    sorted_x = sorted(set(addr_region_items_x))
-    best_gap = 0
-    best_boundary = -1
-    for i in range(len(sorted_x) - 1):
-        gap = sorted_x[i + 1] - sorted_x[i]
-        if gap > best_gap:
-            best_gap = gap
-            best_boundary = (sorted_x[i] + sorted_x[i + 1]) // 2
-
-    # Only filter if there's a clear column gap (at least 150px absolute)
-    if best_gap < 150:
-        logger.debug(f"Column filter: best_gap={best_gap} < 150px, no clear columns")
-        return lines
-
-    logger.debug(f"Column filter: Address at x={addr_x}, column boundary={best_boundary}, gap={best_gap}")
-
-    # Determine which side of the boundary the English column is on
-    english_is_left = addr_x < best_boundary
-
-    logger.debug(f"Column filter: English column is {'LEFT' if english_is_left else 'RIGHT'}")
-
-    # Rebuild lines using only English column items
-    margin = 30  # tolerance in pixels
-    filtered_lines = []
-    for rec in records:
-        items = rec.get('items', [])
-        if not items:
-            filtered_lines.append(rec.get('text', ''))
-            continue
-
-        if english_is_left:
-            keep_items = [item for item in items if item.get('x', 0) < best_boundary + margin]
-        else:
-            keep_items = [item for item in items if item.get('x', 0) >= best_boundary - margin]
-
-        if keep_items:
-            keep_items.sort(key=lambda it: it.get('x', 0))
-            filtered_text = ' '.join(item['text'] for item in keep_items)
-            filtered_lines.append(filtered_text)
-
-    logger.debug(f"Column filter: {len(lines)} lines -> {len(filtered_lines)} filtered lines")
-    for i, ln in enumerate(filtered_lines[:15]):
-        logger.debug(f"  Filtered line {i}: '{ln}'")
-
-    return filtered_lines
 
 
 def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Dict:
@@ -196,14 +115,8 @@ def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Di
     obj['vid'] = extract_vid(text, lines)
     logger.debug(f"VID: {obj['vid']}")
 
-    # Build column-filtered lines for address extraction.
-    # Aadhaar back side often has 2 columns: Hindi (left) + English (right).
-    # PaddleOCR with lang='en' misreads Hindi as ASCII garbage.
-    # Use individual OCR box x-positions to keep only the right (English) column.
-    addr_lines = _filter_english_column(lines, records)
-
-    # Extract address using column-filtered lines
-    obj['address'] = extract_address(addr_lines, "")
+    # Extract address (use existing logic - works well with clean left-column text)
+    obj['address'] = extract_address(lines, "")
     logger.debug(f"Address: {obj['address'][:100]}..." if len(obj['address']) > 100 else f"Address: {obj['address']}")
 
     # Back side: relation names are part of the address (S/O, D/O etc.)
@@ -301,16 +214,6 @@ def extract_aadhaar(lines: List[str], text: str, records: List[Dict]) -> Dict:
     print(f"[DEBUG] Husband: {obj['husband_name']}")
 
     # =========================================================================
-    # STEP 6b: Cross-validate name using relation surname (full e-Aadhaar fix)
-    # =========================================================================
-    print("\n[DEBUG] === Cross-validating Name with Relation Surname ===")
-    obj['name'] = cross_validate_name_with_relation(
-        obj['name'], obj['father_name'], obj['mother_name'], obj['husband_name'],
-        lines, records
-    )
-    print(f"[DEBUG] Name (after cross-validation): {obj['name']}")
-
-    # =========================================================================
     # STEP 7: Extract Address
     # =========================================================================
     print("\n[DEBUG] === Extracting Address ===")
@@ -333,6 +236,12 @@ def extract_aadhaar(lines: List[str], text: str, records: List[Dict]) -> Dict:
 
 def extract_aadhaar_number(text: str, lines: List[str]) -> str:
     """Extract 12-digit Aadhaar number with Verhoeff validation."""
+
+    # Pattern 0: Masked e-Aadhaar format "XXXX XXXX 9420" (last 4 digits visible)
+    # This is the standard format for e-Aadhaar PDFs downloaded from UIDAI
+    masked_match = re.search(r'\bXXXX\s+XXXX\s+(\d{4})\b', text)
+    if masked_match:
+        return f"XXXX XXXX {masked_match.group(1)}"
 
     candidates = []
 
@@ -613,62 +522,38 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
         return text.strip()
 
     # -------------------------------------------------------------------------
-    # Strategy 0: Full e-Aadhaar mini-card format
-    # In full e-Aadhaar (letter with embedded mini cards), the bottom-left card
-    # has: "Name\nDate of Birth/DOB: DD/MM/YYYY\nMale/ MALE"
-    # This is very reliable because the "Date of Birth/DOB:" pattern is unique
-    # to this format (regular front cards just say "DOB:")
-    # -------------------------------------------------------------------------
-    print("[DEBUG] Strategy 0: Looking for name before 'Date of Birth/DOB:' (full e-Aadhaar)...")
-    for i, ln in enumerate(lines):
-        if re.search(r'Date\s*of\s*Birth\s*/?\s*DOB\s*:', ln, re.I):
-            # Found the full "Date of Birth/DOB:" pattern - check lines above for name
-            for k in range(i - 1, max(0, i - 4), -1):
-                candidate = lines[k].strip()
-
-                # Skip blank, Devanagari-only, or boilerplate lines
-                if not candidate:
-                    continue
-                if contains_devanagari(candidate) and not extract_english_only(candidate).strip():
-                    continue
-
-                english_text = extract_english_only(candidate)
-                if is_valid_name_candidate(english_text):
-                    name = clean_name(english_text)
-                    if name and len(name) >= 5:
-                        print(f"[DEBUG] Found name before 'Date of Birth/DOB:': '{name}'")
-                        return name
-            break  # Only use first occurrence of this pattern
-
-    # -------------------------------------------------------------------------
-    # Strategy 1: Find English name after Hindi (Devanagari) name
+    # Strategy 1: Find English name after regional script name
     # This is the most reliable pattern for Aadhaar cards
-    # Also handles merged lines where Hindi+English name are on same line
+    # Also handles merged lines where regional+English name are on same line
+    # Covers all Indian scripts: Devanagari, Telugu, Tamil, Odia, etc.
     # -------------------------------------------------------------------------
-    print("[DEBUG] Strategy 1: Looking for English name after Hindi name...")
+    print("[DEBUG] Strategy 1: Looking for English name after regional script name...")
     for i in range(len(lines)):
-        if contains_devanagari(lines[i]):
-            # First: check if this line has BOTH Devanagari AND English name
+        if _contains_indic_script(lines[i]):
+            # First: check if this line has BOTH regional script AND English name
             # (OCR may merge "आशा लक्ष्मन बिसाने ASHA LAXMAN BISANE" into one line)
+            # Exclude gender lines like "స్త్రీ/ FEMALE" which have Indic + English gender word
             english_part = extract_english_only(lines[i])
-            if english_part and is_valid_name_candidate(english_part):
+            if (english_part
+                    and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_part, re.I)
+                    and is_valid_name_candidate(english_part)):
                 name = clean_name(english_part)
                 if name and len(name) >= 5:
-                    print(f"[DEBUG] Found name in merged Devanagari+English line: '{name}'")
+                    print(f"[DEBUG] Found name in merged regional+English line: '{name}'")
                     return name
 
             # Then: check next few lines for English name
             for j in range(i + 1, min(i + 3, len(lines))):
                 next_ln = lines[j].strip()
 
-                # Skip if this line also has Devanagari
-                if contains_devanagari(next_ln):
+                # Skip if this line also has any Indic script
+                if _contains_indic_script(next_ln):
                     continue
 
                 # Skip if it's a DOB or gender line
                 if re.search(r'\bDOB\b|जन्म|तिथि|\d{2}/\d{2}/\d{4}', next_ln, re.I):
                     continue
-                if re.search(r'\b(MALE|FEMALE)\b', next_ln, re.I):
+                if re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', next_ln, re.I):
                     continue
 
                 # Check if it looks like a name
@@ -676,8 +561,23 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 if is_valid_name_candidate(english_text):
                     name = clean_name(english_text)
                     if name and len(name) >= 5:
-                        print(f"[DEBUG] Found name via Devanagari anchor: '{name}'")
+                        print(f"[DEBUG] Found name via regional anchor: '{name}'")
                         return name
+                # Lighter fallback: Indian names like "Lakshmi" have consonant clusters
+                # (KSHM) that is_likely_garbage incorrectly flags. Use direct check here
+                # since we have strong anchor (Indic script on previous line).
+                elif english_text and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_text, re.I):
+                    s1_words = english_text.split()
+                    if (2 <= len(s1_words) <= 5
+                            and not re.search(r'\d', english_text)
+                            and not any(p in english_text.lower() for p in skip_patterns)
+                            and has_reasonable_vowel_ratio(english_text)
+                            and not looks_like_address(english_text)
+                            and all(len(w) >= 2 and (w[0].isupper() or w.isupper()) for w in s1_words)):
+                        name = clean_name(english_text)
+                        if name and len(name) >= 5:
+                            print(f"[DEBUG] Found name via regional anchor (lighter check): '{name}'")
+                            return name
 
     # -------------------------------------------------------------------------
     # Strategy 2: Find name in "To" block (e-Aadhaar format)
@@ -694,13 +594,13 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 # Remove "To" prefix if on same line
                 candidate = re.sub(r'^To\s+', '', candidate, flags=re.I)
 
-                # Skip Devanagari lines (often the Hindi name)
-                if contains_devanagari(candidate):
+                # Skip regional script lines (Devanagari, Telugu, Tamil, Odia, etc.)
+                if _contains_indic_script(candidate):
                     continue
 
                 # Extract English
                 english_text = extract_english_only(candidate)
-                
+
                 # Skip if looks like address (has locality/area keywords)
                 address_keywords = ['nagar', 'village', 'road', 'street', 'lane', 'sector',
                                    'colony', 'house', 'flat', 'building', 'block', 'side',
@@ -708,10 +608,21 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 if any(kw in english_text.lower() for kw in address_keywords):
                     print(f"[DEBUG] Skipping address-like line: '{english_text}'")
                     continue
-                
-                if is_valid_name_candidate(english_text):
+
+                # In the To-block we have a strong positional anchor (right after "To"
+                # + skipped all Indic script lines). Use a lighter check here instead of
+                # is_valid_name_candidate, which calls is_likely_garbage and incorrectly
+                # rejects common Indian names with consonant clusters (e.g., Lakshmi→KSHM).
+                to_words = english_text.split()
+                if (1 <= len(to_words) <= 5
+                        and not re.search(r'\d', english_text)
+                        and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_text, re.I)
+                        and not any(p in english_text.lower() for p in skip_patterns)
+                        and has_reasonable_vowel_ratio(english_text)
+                        and all(len(w) >= 2 and (w[0].isupper() or w.isupper()) for w in to_words)):
                     name = clean_name(english_text)
-                    if name and len(name) >= 5:
+                    min_len = 3 if len(to_words) == 1 else 5
+                    if name and len(name) >= min_len:
                         print(f"[DEBUG] Found name in 'To' block: '{name}'")
                         return name
 
@@ -820,86 +731,6 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
 
     print("[DEBUG] No name found!")
     return ""
-
-
-def cross_validate_name_with_relation(
-    name: str, father: str, mother: str, husband: str,
-    lines: List[str], records: List[Dict]
-) -> str:
-    """Cross-validate extracted name using relation name's surname.
-
-    In full e-Aadhaar format, OCR sometimes picks up garbage text as the name
-    (e.g., "FIBLIE ADHAAR" instead of "Saksham Limje"). If the extracted name
-    doesn't share a surname with the relation (father/husband), search for a
-    better candidate that does.
-
-    Only triggers when:
-    - A relation name (father/husband) is found with a clear surname
-    - The current name does NOT share that surname
-    """
-    # Determine the reference surname from relation names
-    relation_name = father or husband
-    if not relation_name:
-        return name
-
-    relation_parts = relation_name.strip().split()
-    if len(relation_parts) < 2:
-        return name
-
-    surname = relation_parts[-1].lower()
-
-    # Check if current name already shares the surname
-    if name:
-        name_parts = name.strip().split()
-        if any(p.lower() == surname for p in name_parts):
-            return name
-
-    # Current name doesn't share surname - look for a better candidate
-    # Search lines for a title-case or all-caps name that shares the surname
-    print(f"[DEBUG] Cross-validation: name '{name}' doesn't match surname '{surname}', searching...")
-
-    skip_patterns = [
-        'government', 'india', 'aadhaar', 'uidai', 'unique', 'identification',
-        'authority', 'enrolment', 'enrollment', 'address', 'help@', 'www.',
-        'mera', 'meri', 'pahchan', 'signature', 'valid'
-    ]
-
-    best_candidate = None
-    for ln in lines:
-        # Skip boilerplate
-        if any(p in ln.lower() for p in skip_patterns):
-            continue
-        # Skip relation marker lines (these contain the father/husband name, not person name)
-        if re.search(r'\b(S/O|D/O|W/O|C/O|SON\s*OF|DAUGHTER\s*OF|WIFE\s*OF)\b', ln, re.I):
-            continue
-        # Skip lines with digits
-        if re.search(r'\d', ln):
-            continue
-
-        english_text = extract_english_only(ln).strip()
-        if not english_text or len(english_text) < 5:
-            continue
-
-        words = english_text.split()
-        if len(words) < 2 or len(words) > 4:
-            continue
-
-        # Check if this candidate shares the surname
-        if any(w.lower() == surname for w in words):
-            # Validate it looks like a name
-            if has_reasonable_vowel_ratio(english_text) and not is_likely_garbage(english_text):
-                # Prefer title case names
-                if all(w[0].isupper() for w in words if w.isalpha()):
-                    candidate = clean_ocr_garbage(english_text)
-                    if candidate and len(candidate) >= 5:
-                        if best_candidate is None or is_title_case_name(candidate):
-                            best_candidate = candidate
-
-    if best_candidate:
-        print(f"[DEBUG] Cross-validation found better name: '{best_candidate}'")
-        return best_candidate
-
-    return name
 
 
 def extract_relation_names(lines: List[str], person_name: str) -> Tuple[str, str, str]:
@@ -1020,69 +851,10 @@ def _clean_address_token(token: str) -> str:
     if len(token) == 1 and token.islower():
         return ""
 
-    # Remove short mixed-case/digit tokens that are garbage from bilingual OCR merge
-    # e.g. "1s", "Is" (when not a real word in address context)
-    if len(token) == 2 and re.search(r'\d', token) and re.search(r'[a-zA-Z]', token):
-        return ""
-
     # Remove tokens that mix digits and uppercase letters in garbage patterns
-    # e.g. "3ITETT", "5HRTT", "4R46" but NOT "A-202" or "401203"
-    # Note: valid house numbers (A-202, B101) are already handled above
+    # e.g. "3ITETT", "5HRTT" but NOT "A-202" or "401203"
     if re.match(r'^\d+[A-Z]{2,}$', token) or re.match(r'^[A-Z]+\d+[A-Z]+$', token):
         return ""
-    # Catch remaining digit+uppercase mixes like "4R46" (digit-letter-digit patterns)
-    if re.search(r'\d', token) and re.search(r'[A-Z]', token) and not re.search(r'[a-z]', token):
-        # This token has digits and uppercase but no lowercase — likely garbage
-        # Valid patterns (A-202, B101) were already returned above
-        return ""
-
-    # Remove tokens that mix lowercase letters and digits in garbage patterns
-    # e.g. "12sbjlalle", "it2", "Plt2c" — transliteration artifacts from Hindi/Marathi
-    # Real address tokens with digits are house numbers (A-202, No.22) or PIN codes (already handled above)
-    if re.search(r'\d', token) and re.search(r'[a-z]', token):
-        # Allow known patterns like "No22", "Sector1" etc.
-        if not re.match(r'^(No|Sector|Ward|Plot|Block|Phase|Floor|Flat)\s*[\.\-]?\s*\d+$', token, re.I):
-            return ""
-
-    # Remove tokens with abnormal casing patterns (Hindi OCR garbage)
-    # Valid English address words are: Title Case ("Nagpur"), ALL CAPS ("S/O"), or lowercase ("road")
-    # Garbage patterns: "dcST", "PadOG", "oOye", "PadcloiG" - lowercase followed by uppercase mid-word
-    if len(token) >= 3 and re.search(r'[a-z][A-Z]', token):
-        # Allow known patterns like "McDonald" or abbreviations in camelCase won't appear in addresses
-        return ""
-
-    # Remove ALL CAPS tokens that have excessive consonants (Hindi OCR garbage like "SIOTHGT", "HERTOE")
-    # Valid all-caps address tokens are short abbreviations (S/O, CO) or state names
-    if token.isupper() and len(token) >= 5:
-        alpha_only = re.sub(r'[^A-Z]', '', token)
-        if alpha_only:
-            vowels = sum(1 for c in alpha_only if c in 'AEIOUY')
-            consonants = len(alpha_only) - vowels
-            # Real words have vowel ratio >= 30%; garbage like SIOTHGT (28%) or HERTOE are suspect
-            # Also check for unusual consonant clusters
-            if re.search(r'[BCDFGHJKLMNPQRSTVWXZ]{3,}', alpha_only):
-                return ""
-
-    # Remove pure lowercase gibberish tokens (transliteration artifacts)
-    # e.g. "jlaede", "lnllef", "elhih", "lie" — from Hindi/Marathi OCR bleed
-    # In address context, real English words are either:
-    #   - Capitalized proper nouns (place names): "Wardha", "Maharashtra"
-    #   - Known common address words: "near", "behind", "post", "dist", "village"
-    # Pure lowercase tokens that aren't recognized address words are garbage
-    if token.islower() and len(token) >= 2:
-        # Known lowercase address words that are valid
-        valid_address_words = {
-            'at', 'po', 'to', 'of', 'in', 'on', 'no', 'nr', 'via', 'opp',
-            'tal', 'tah', 'tab', 'div', 'moh', 'dist', 'post', 'near',
-            'behind', 'opposite', 'beside', 'above', 'below', 'next',
-            'road', 'street', 'lane', 'nagar', 'colony', 'village',
-            'house', 'flat', 'floor', 'block', 'sector', 'ward',
-            'plot', 'building', 'complex', 'chowk', 'bazar', 'market',
-            'city', 'town', 'state', 'pin', 'cross', 'main', 'old', 'new',
-            'east', 'west', 'north', 'south', 'central',
-        }
-        if token not in valid_address_words:
-            return ""
 
     return token
 
@@ -1148,12 +920,8 @@ def _clean_and_deduplicate_address(address_parts: List[str], person_name: str = 
     for p in filtered:
         for comp in p.split(','):
             comp = comp.strip().strip(',-.:')
-            if not comp:
-                continue
-            # Filter out person name at component level too
-            if person_name and comp.upper().strip() == person_name.upper().strip():
-                continue
-            all_components.append(comp)
+            if comp:
+                all_components.append(comp)
 
     # Deduplicate at the component level
     def normalize(s):
@@ -1186,26 +954,12 @@ def _clean_and_deduplicate_address(address_parts: List[str], person_name: str = 
     for comp in all_components:
         # Remove very short garbage fragments (e.g. "g", "a", "ON 3")
         # but keep legitimate short components like "No 22" when part of larger context
-        # Also keep PIN codes (6-digit numbers) and house numbers (A-202, B 101, etc.)
-        if re.match(r'^\d{6}$', comp.strip()):
-            cleaned_components.append(comp)
-            continue
-        # Keep house number patterns: single letter + digits (A-202, A 202, B-101)
-        if re.match(r'^[A-Za-z]\s*[-\s]?\s*\d{1,4}$', comp.strip()):
-            cleaned_components.append(comp)
-            continue
         alpha_only = re.sub(r'[^a-zA-Z]', '', comp)
         if len(alpha_only) < 2:
             continue
         # Remove standalone 2-letter fragments with digits that look like OCR garbage
         if len(alpha_only) == 2 and len(comp) <= 4 and re.search(r'\d', comp):
             continue
-        # Remove standalone short (2-3 letter) components that aren't valid address words
-        # e.g. "Is", "li", "Os" — leftover garbage from bilingual OCR merge
-        if len(alpha_only) <= 3 and len(comp) <= 4:
-            valid_short = {'at', 'po', 'to', 'of', 'no', 'nr', 'rd', 'st', 'so', 'do', 'via', 'opp', 'tal', 'tah', 'tab', 'div', 'moh'}
-            if alpha_only.lower() not in valid_short:
-                continue
         # Remove fragments that look like garbled relation markers (O/s, S/0, etc.)
         if re.match(r'^[A-Za-z]/[a-z]\b', comp) and not re.match(r'^(S/O|D/O|W/O|C/O)\b', comp, re.I):
             continue
@@ -1361,11 +1115,11 @@ def extract_address(lines: List[str], person_name: str) -> str:
             if re.search(r'\b\d{4}\s+\d{4}\s+\d{4}\b', ln) or re.search(r'\b\d{12}\b', ln):
                 break
 
-            # 1c. Skip purely Devanagari lines (Hindi/Marathi text on back side)
+            # 1c. Skip purely regional script lines (Hindi/Marathi/Telugu/Tamil/Odia etc.)
             english_content = extract_english_only(ln).strip()
             # Remove just digits and punctuation to check if any real English words remain
             english_words_only = re.sub(r'[^a-zA-Z\s]', '', english_content).strip()
-            if contains_devanagari(ln) and len(english_words_only) < 3:
+            if _contains_indic_script(ln) and len(english_words_only) < 3:
                 continue
 
             # 2. Clean merged boilerplate from line instead of skipping
@@ -1416,9 +1170,7 @@ def extract_address(lines: List[str], person_name: str) -> str:
                     continue
 
                 # Skip the person's name if seen right after "To"
-                # Use contains check to handle garbage prefixes (e.g. "4R46 PAYAL LAXMAN BISANE")
-                if person_name and (clean_line.upper() == person_name.upper()
-                                    or person_name.upper() in clean_line.upper()):
+                if person_name and clean_line.upper() == person_name.upper():
                     name_found = True
                     continue
                 
@@ -1494,4 +1246,3 @@ def extract_address(lines: List[str], person_name: str) -> str:
         return _clean_and_deduplicate_address(address_parts, person_name)
 
     return ""
-
