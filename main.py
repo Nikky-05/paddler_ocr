@@ -600,6 +600,53 @@ def pdf_to_images(pdf_bytes: bytes) -> List[Image.Image]:
         raise ValueError(f"Failed to process PDF: {str(e)}")
 
 
+def extract_text_from_pdf_direct(pdf_bytes: bytes) -> Optional[List[Dict]]:
+    """Extract text directly from digitally-generated PDFs (e-Aadhaar, etc.).
+
+    Digitally-generated PDFs have embedded text that can be read directly
+    without OCR, giving perfect accuracy. Falls back to None if the PDF
+    is a scanned image (no embedded text).
+
+    Returns:
+        List of OCR-like records (text, conf, y, x) or None if not enough text.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if len(doc) == 0:
+            doc.close()
+            return None
+
+        page = doc[0]
+        blocks = page.get_text("blocks")
+        doc.close()
+
+        records = []
+        for block in blocks:
+            if block[6] != 0:  # skip image blocks
+                continue
+            text = block[4].strip()
+            if not text:
+                continue
+            y = int(block[1])
+            x = int(block[0])
+            for line in text.split('\n'):
+                line = line.strip()
+                if line:
+                    records.append({"text": line, "conf": 1.0, "y": y, "x": x})
+                    y += 15  # approximate line spacing
+
+        # Need enough text to be a digitally-generated PDF (not a scanned image)
+        total_text = ' '.join(r['text'] for r in records)
+        if len(total_text) < 50:
+            return None
+
+        print(f"[DEBUG] Direct PDF text extraction: {len(records)} lines, {len(total_text)} chars")
+        return records
+    except Exception as e:
+        print(f"[DEBUG] Direct PDF extraction failed: {e}")
+        return None
+
+
 # ============ Document Extractors ============
 # Import extractors from separate modules
 
@@ -678,6 +725,8 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
     # Check if file is PDF or image
     file_ext = file.filename.lower().split('.')[-1] if file.filename else ''
     
+    direct_text_used = False
+
     if file_ext == 'pdf':
         # Process PDF: convert to images and process first page
         try:
@@ -688,15 +737,26 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to process PDF: {str(e)}")
+
+        # For PDFs: try direct text extraction first (e-Aadhaar and other
+        # digitally-generated PDFs have embedded text → perfect accuracy,
+        # no OCR errors like merged lines or misread characters).
+        direct_records = extract_text_from_pdf_direct(content)
+        if direct_records:
+            records = direct_records
+            direct_text_used = True
+            print("[DEBUG] Using direct PDF text extraction (skipping OCR)")
     else:
         # Process as image
         try:
             img = Image.open(BytesIO(content)).convert('RGB')
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid image file or format")
-    
-    # Run OCR on original image (no preprocessing)
-    records = ocr_records_from_image(img, doc_type)
+
+    # Fall back to OCR if direct text extraction was not available
+    if not direct_text_used:
+        records = ocr_records_from_image(img, doc_type)
+
     lines = [r['text'] for r in records]
     text = "\n".join(lines)
 
