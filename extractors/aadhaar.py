@@ -483,10 +483,26 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
         if len(words) < 2:
             return False
 
-        # Skip if looks like an address (contains locality keywords)
-        address_keywords = ['nagar', 'village', 'road', 'street', 'lane', 'sector', 
-                           'colony', 'house', 'flat', 'building', 'block']
+        # Skip if looks like an address (contains locality/admin keywords)
+        address_keywords = ['nagar', 'village', 'road', 'street', 'lane', 'sector',
+                           'colony', 'house', 'flat', 'building', 'block',
+                           'district', 'tehsil', 'taluk', 'mandal', 'taluka',
+                           'sub district', 'subdistrict', 'subdivision',
+                           'vtc', ' po ', 'post office', 'pin code', 'pincode']
         if any(kw in text_lower for kw in address_keywords):
+            return False
+
+        # Skip Indian state names (appear in addresses, not person names)
+        # NOTE: text_lower has spaces stripped, so compare against text.lower().strip()
+        indian_states = {
+            'andhra pradesh', 'arunachal pradesh', 'assam', 'bihar', 'chhattisgarh',
+            'goa', 'gujarat', 'haryana', 'himachal pradesh', 'jharkhand', 'karnataka',
+            'kerala', 'madhya pradesh', 'maharashtra', 'manipur', 'meghalaya', 'mizoram',
+            'nagaland', 'odisha', 'punjab', 'rajasthan', 'sikkim', 'tamil nadu',
+            'telangana', 'tripura', 'uttar pradesh', 'uttarakhand', 'west bengal',
+            'delhi', 'jammu', 'kashmir', 'ladakh', 'chandigarh', 'puducherry'
+        }
+        if text.lower().strip() in indian_states:
             return False
 
         # Check vowel ratio (names have vowels)
@@ -534,13 +550,28 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
             # (OCR may merge "आशा लक्ष्मन बिसाने ASHA LAXMAN BISANE" into one line)
             # Exclude gender lines like "స్త్రీ/ FEMALE" which have Indic + English gender word
             english_part = extract_english_only(lines[i])
-            if (english_part
-                    and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_part, re.I)
-                    and is_valid_name_candidate(english_part)):
-                name = clean_name(english_part)
-                if name and len(name) >= 5:
-                    print(f"[DEBUG] Found name in merged regional+English line: '{name}'")
-                    return name
+            if english_part and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_part, re.I):
+                # Case A: merged line has S/O inside e.g. "Sachin S/O Chandra Shekhar"
+                # Extract name from BEFORE the relation marker
+                pre_so_m = re.match(r'^([A-Za-z][A-Za-z\s]{1,30}?)\s+\b(?:S/O|D/O|W/O|C/O|SON OF|DAUGHTER OF|WIFE OF)\b', english_part, re.I)
+                if pre_so_m:
+                    pre_name = pre_so_m.group(1).strip()
+                    pre_words = pre_name.split()
+                    if (1 <= len(pre_words) <= 4
+                            and not re.search(r'\d', pre_name)
+                            and not any(p in pre_name.lower() for p in skip_patterns)
+                            and has_reasonable_vowel_ratio(pre_name)
+                            and all(len(w) >= 2 and (w[0].isupper() or w.isupper()) for w in pre_words)):
+                        name = clean_name(pre_name)
+                        if name and len(name) >= 3:
+                            print(f"[DEBUG] Found name before S/O in merged Indic+English line: '{name}'")
+                            return name
+                # Case B: no S/O - validate normally
+                elif is_valid_name_candidate(english_part):
+                    name = clean_name(english_part)
+                    if name and len(name) >= 5:
+                        print(f"[DEBUG] Found name in merged regional+English line: '{name}'")
+                        return name
 
             # Then: check next few lines for English name
             for j in range(i + 1, min(i + 3, len(lines))):
@@ -566,16 +597,19 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 # Lighter fallback: Indian names like "Lakshmi" have consonant clusters
                 # (KSHM) that is_likely_garbage incorrectly flags. Use direct check here
                 # since we have strong anchor (Indic script on previous line).
+                # Also handles single-word names like "Sachin" with strong positional anchor.
                 elif english_text and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_text, re.I):
                     s1_words = english_text.split()
-                    if (2 <= len(s1_words) <= 5
+                    if (1 <= len(s1_words) <= 5
                             and not re.search(r'\d', english_text)
+                            and not re.search(r'\b(S/O|D/O|W/O|C/O)\b', english_text, re.I)
                             and not any(p in english_text.lower() for p in skip_patterns)
                             and has_reasonable_vowel_ratio(english_text)
                             and not looks_like_address(english_text)
                             and all(len(w) >= 2 and (w[0].isupper() or w.isupper()) for w in s1_words)):
                         name = clean_name(english_text)
-                        if name and len(name) >= 5:
+                        min_s1_len = 3 if len(s1_words) == 1 else 5
+                        if name and len(name) >= min_s1_len:
                             print(f"[DEBUG] Found name via regional anchor (lighter check): '{name}'")
                             return name
 
@@ -670,11 +704,63 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
             return name
 
     # -------------------------------------------------------------------------
-    # Strategy 5: Find Title Case name pattern
-    # Pattern: "Firstname Middlename Lastname"
+    # Strategy 5: Use relation marker as anchor
+    # Look for name BEFORE S/O on same line OR on line above S/O.
+    # This is more reliable than generic Title Case scan, so run it first.
+    # Also handles single-word names like "Sachin".
     # -------------------------------------------------------------------------
-    print("[DEBUG] Strategy 5: Looking for Title Case name pattern...")
+    print("[DEBUG] Strategy 5: Looking for name above/before relation markers...")
     for i, ln in enumerate(lines):
+        if re.search(r'\b(S/O|D/O|W/O|C/O|SON OF|DAUGHTER OF|WIFE OF)\b', ln, re.I):
+            # Case A: Name is BEFORE S/O on the same line e.g. "Sachin S/O Chandra Shekhar"
+            pre_so = re.match(r'^([A-Za-z][A-Za-z\s]{1,30}?)\s+\b(?:S/O|D/O|W/O|C/O|SON OF|DAUGHTER OF|WIFE OF)\b', ln, re.I)
+            if pre_so:
+                pre_text = pre_so.group(1).strip()
+                pre_words = pre_text.split()
+                if (1 <= len(pre_words) <= 4
+                        and not re.search(r'\d', pre_text)
+                        and not any(p in pre_text.lower() for p in skip_patterns)
+                        and has_reasonable_vowel_ratio(pre_text)
+                        and all(len(w) >= 2 and (w[0].isupper() or w.isupper()) for w in pre_words)):
+                    name = clean_name(pre_text)
+                    if name and len(name) >= 3:
+                        print(f"[DEBUG] Found name before S/O on same line: '{name}'")
+                        return name
+
+            # Case B: Name is on the line ABOVE S/O
+            if i > 0:
+                candidate = lines[i - 1]
+                english_text = extract_english_only(candidate).strip()
+                # First try full validation (multi-word names)
+                if is_valid_name_candidate(english_text):
+                    name = clean_name(english_text)
+                    if name and len(name) >= 5:
+                        print(f"[DEBUG] Found name above relation marker: '{name}'")
+                        return name
+                # Fallback: allow single-word names (e.g. "Sachin") when anchored by S/O
+                words = english_text.split()
+                if (len(words) == 1
+                        and len(english_text) >= 3
+                        and not re.search(r'\d', english_text)
+                        and not any(p in english_text.lower() for p in skip_patterns)
+                        and has_reasonable_vowel_ratio(english_text)
+                        and english_text[0].isupper()):
+                    name = clean_name(english_text)
+                    if name:
+                        print(f"[DEBUG] Found single-word name above relation marker: '{name}'")
+                        return name
+
+    # -------------------------------------------------------------------------
+    # Strategy 6: Find Title Case name pattern
+    # Pattern: "Firstname Middlename Lastname"
+    # Skip lines that contain relation markers (S/O etc.) to avoid extracting
+    # the father's name from "S/O Chandra Shekhar" as the person's name.
+    # -------------------------------------------------------------------------
+    print("[DEBUG] Strategy 6: Looking for Title Case name pattern...")
+    for i, ln in enumerate(lines):
+        # Skip lines with relation markers
+        if re.search(r'\b(S/O|D/O|W/O|C/O|SON\s*OF|DAUGHTER\s*OF|WIFE\s*OF|CARE\s*OF)\b', ln, re.I):
+            continue
         # Look for Title Case pattern
         match = re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b', ln)
         if match:
@@ -684,22 +770,6 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 if name and len(name) >= 5:
                     print(f"[DEBUG] Found Title Case name: '{name}'")
                     return name
-
-    # -------------------------------------------------------------------------
-    # Strategy 6: Use relation marker as anchor
-    # Look for line above S/O, D/O, W/O, C/O
-    # -------------------------------------------------------------------------
-    print("[DEBUG] Strategy 6: Looking for name above relation markers...")
-    for i, ln in enumerate(lines):
-        if re.search(r'\b(S/O|D/O|W/O|C/O|SON OF|DAUGHTER OF|WIFE OF)\b', ln, re.I):
-            if i > 0:
-                candidate = lines[i - 1]
-                english_text = extract_english_only(candidate)
-                if is_valid_name_candidate(english_text):
-                    name = clean_name(english_text)
-                    if name and len(name) >= 5:
-                        print(f"[DEBUG] Found name above relation marker: '{name}'")
-                        return name
 
     # -------------------------------------------------------------------------
     # Strategy 7: Fallback - scan all records for best name candidate
