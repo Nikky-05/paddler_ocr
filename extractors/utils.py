@@ -471,20 +471,27 @@ def split_address(address_str: str) -> dict:
     addr = address_str.strip()
 
     # --- PIN code (6-digit Indian postal code) ---
-    pin_match = re.search(r'\b(\d{6})\b', addr)
+    # Consume an optional "PIN Code"/"PIN" label too, so it doesn't linger as junk.
+    pin_match = re.search(r'(?:\bpin(?:\s*code)?\s*[:.\-]?\s*)?\b(\d{6})\b', addr, re.I)
     if pin_match:
         result["pin"] = pin_match.group(1)
         addr = addr[:pin_match.start()] + addr[pin_match.end():]
 
-    # --- State ---
+    # --- State (consume an optional preceding "State" label) ---
     addr_lower = addr.lower()
     for state in sorted(INDIAN_STATES, key=len, reverse=True):
-        pattern = r'\b' + re.escape(state) + r'\b'
+        pattern = r'(?:\bstate\s*[:.\-]?\s*)?\b' + re.escape(state) + r'\b'
         m = re.search(pattern, addr_lower)
         if m:
-            result["state"] = addr[m.start():m.end()].strip()
+            result["state"] = state.title()
             addr = addr[:m.start()] + addr[m.end():]
             break
+
+    # --- Sub-district / tehsil (remove FIRST so the plain "District" match below
+    # grabs the real district value, not the sub-district's) ---
+    subdist_match = re.search(r'\bsub[\s.\-]*dist(?:rict)?[\s.:~-]*([A-Za-z\s]+)', addr, re.I)
+    if subdist_match:
+        addr = addr[:subdist_match.start()] + addr[subdist_match.end():]
 
     # --- District ---
     dist_match = re.search(r'\b(?:dist(?:rict)?|distt?)[\s.:~-]*([A-Za-z\s]+)', addr, re.I)
@@ -560,6 +567,12 @@ def split_address(address_str: str) -> dict:
             continue
 
         remaining.append(part.strip())
+
+    # Drop pure label remnants left over from extraction (e.g. a stray "State",
+    # "Sub", "PIN Code") so they don't pollute untagged.
+    _label_only = {'state', 'sub', 'dist', 'district', 'sub district', 'pin',
+                   'pin code', 'vtc', 'po', 'post', 'tehsil', 'taluka', 'mandal'}
+    remaining = [r for r in remaining if r.lower().strip(' :.-') not in _label_only]
 
     # Anything left goes to untagged
     untagged = ", ".join(remaining).strip(", ").strip()

@@ -772,6 +772,25 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
         }
         return response
 
+    # For full e-Aadhaar LETTER scans (4-up layout: front + INFORMATION panel on
+    # top, back card + address + QR on the bottom): running OCR over the whole
+    # multi-column page merges the dense bilingual INFORMATION panel into the data
+    # columns and produces garbage. Crop to the LEFT column — which carries name,
+    # DOB, gender, address and the Aadhaar number — and re-OCR for clean text.
+    # Only for image uploads; PDFs use the perfect direct-text path above.
+    if doc_type == 'aadhaar' and not direct_text_used:
+        from extractors.aadhaar import is_full_eaadhaar_letter
+        if is_full_eaadhaar_letter(lines, text):
+            print("[DEBUG] Detected full e-Aadhaar letter — cropping to left column for clean OCR")
+            w, h = img.size
+            left_img = img.crop((0, 0, int(w * 0.52), h))
+            left_records = ocr_records_from_image(left_img, doc_type)
+            if left_records:
+                img = left_img
+                records = left_records
+                lines = [r['text'] for r in records]
+                text = "\n".join(lines)
+
     # Validate document type
     is_valid_document = validate_document_type(doc_type, lines, text)
 

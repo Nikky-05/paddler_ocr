@@ -77,6 +77,37 @@ def is_aadhaar_back_side(lines: List[str], text: str) -> bool:
     return False
 
 
+def is_full_eaadhaar_letter(lines: List[str], text: str) -> bool:
+    """Detect the full downloadable e-Aadhaar LETTER scanned/saved as an image.
+
+    This is the multi-column UIDAI letter (4-up): front + dense bilingual
+    INFORMATION panel on top, back card + address + QR on the bottom. When OCR
+    runs over the whole page, the INFORMATION panel and the right-hand columns
+    merge into the data columns at the same y-position, producing garbage.
+    The caller should crop to the LEFT column (which carries name, DOB, gender,
+    address and the Aadhaar number) and re-run OCR for clean text.
+
+    Distinguished from PVC cards, cropped front/back photos and KYC reports by
+    the long INFORMATION-panel boilerplate paragraphs, which appear ONLY on the
+    full letter. Requiring two or more distinct phrases avoids false positives
+    on single-column documents (cropping those would cut off half the text).
+    """
+    t = text.lower()
+    info_markers = [
+        'obligated to seek consent',
+        'lock/unlock',
+        'qr code reader',
+        'documents to support identity',
+        'aadhaar is unique and secure',
+        'proof of identity, not of citizenship',
+        'authentication agency or qr code',
+        'avail of various government',
+        'keep your mobile number and email',
+    ]
+    hits = sum(1 for m in info_markers if m in t)
+    return hits >= 2
+
+
 def extract_aadhaar_back(lines: List[str], text: str, records: List[Dict]) -> Dict:
     """Extract data from Aadhaar card back side.
 
@@ -537,6 +568,43 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
 
         return text.strip()
 
+    # Address-token keywords seen on Aadhaar address lines. Used to reject
+    # address fragments (e.g. "VTC: Ladalla", "State: Maharashtra") that the
+    # lighter name checks would otherwise accept. Supplements looks_like_address,
+    # which misses Aadhaar-specific tokens like VTC / PO / mandal.
+    _addr_kw = ('nagar', 'village', 'road', 'street', 'lane', 'sector', 'colony',
+                'house', 'flat', 'building', 'block', 'district', 'tehsil', 'taluk',
+                'mandal', 'taluka', 'subdistrict', 'sub district', 'subdivision',
+                'vtc', 'post office', 'pin code', 'pincode', 'state', 'room', 'floor',
+                'marg', 'apartment', 'near ', ' po ', 'po:', 'post', 'gav', 'gaon')
+
+    def looks_addressy(t: str) -> bool:
+        """True if the text is an address line rather than a name."""
+        tl = t.lower()
+        if any(kw in tl for kw in _addr_kw):
+            return True
+        return looks_like_address(t)
+
+    def strip_leading_garbage(t: str) -> str:
+        """Drop leading OCR-garbage tokens from a name candidate.
+
+        On full e-Aadhaar letters the regional-script name often bleeds a short
+        junk token in front of the English name (e.g. "S e Pinnoju Vijaya
+        Lakshmi", "3o Parasa Naga ..."). Strip leading tokens that are single
+        characters, digit-bearing, or short and vowel-less, until a plausible
+        name word is reached. (May drop a leading single-letter initial — an
+        acceptable trade-off for removing clear garbage.)
+        """
+        words = t.split()
+        while words:
+            w = words[0].strip('.,:;-')
+            if (not w or len(w) <= 1 or re.search(r'\d', w)
+                    or (len(w) <= 3 and not has_reasonable_vowel_ratio(w))):
+                words.pop(0)
+                continue
+            break
+        return ' '.join(words)
+
     # -------------------------------------------------------------------------
     # Strategy 1: Find English name after regional script name
     # This is the most reliable pattern for Aadhaar cards
@@ -619,9 +687,32 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
     # Key: Take FIRST valid name candidate after "To" label
     # -------------------------------------------------------------------------
     print("[DEBUG] Strategy 2: Looking for name in 'To' block...")
+    relation_re = r'\b(S/O|D/O|W/O|C/O|SON\s*OF|DAUGHTER\s*OF|WIFE\s*OF|CARE\s*OF)\b'
     for i, ln in enumerate(lines):
         if re.match(r'^\s*To\s*$', ln, re.I) or re.search(r'^To\s+[A-Z]', ln):
-            # Check next few lines - take FIRST valid name, skip address lines
+            # Case A: the name is on the SAME line as "To" (e.g. "To Mohd Junaid").
+            # This happens when OCR groups the label and name into one box (common
+            # once the noisy right column is removed). Read it directly.
+            inline = re.match(r'^\s*To\s+(.+)$', ln, re.I)
+            if inline:
+                inline_text = strip_leading_garbage(extract_english_only(inline.group(1)).strip())
+                inline_words = inline_text.split()
+                if (inline_text
+                        and not re.search(relation_re, inline_text, re.I)
+                        and 1 <= len(inline_words) <= 5
+                        and not re.search(r'\d', inline_text)
+                        and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', inline_text, re.I)
+                        and not any(p in inline_text.lower() for p in skip_patterns)
+                        and has_reasonable_vowel_ratio(inline_text)
+                        and not looks_addressy(inline_text)
+                        and all(len(w) >= 2 and (w[0].isupper() or w.isupper()) for w in inline_words)):
+                    name = clean_name(inline_text)
+                    min_len = 3 if len(inline_words) == 1 else 5
+                    if name and len(name) >= min_len:
+                        print(f"[DEBUG] Found name on 'To' line: '{name}'")
+                        return name
+
+            # Case B: check next few lines - take FIRST valid name, skip address lines
             for j in range(i + 1, min(i + 5, len(lines))):
                 candidate = lines[j]
 
@@ -632,14 +723,12 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 if _contains_indic_script(candidate):
                     continue
 
-                # Extract English
-                english_text = extract_english_only(candidate)
+                # Extract English, then strip any leading regional-script garbage
+                # token (e.g. "3o Parasa ...", "S e Pinnoju ...").
+                english_text = strip_leading_garbage(extract_english_only(candidate))
 
-                # Skip if looks like address (has locality/area keywords)
-                address_keywords = ['nagar', 'village', 'road', 'street', 'lane', 'sector',
-                                   'colony', 'house', 'flat', 'building', 'block', 'side',
-                                   'bapera', 'deosarra', 'taperi']
-                if any(kw in english_text.lower() for kw in address_keywords):
+                # Skip if it looks like an address line (locality/area keywords)
+                if looks_addressy(english_text):
                     print(f"[DEBUG] Skipping address-like line: '{english_text}'")
                     continue
 
@@ -650,6 +739,7 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
                 to_words = english_text.split()
                 if (1 <= len(to_words) <= 5
                         and not re.search(r'\d', english_text)
+                        and not re.search(relation_re, english_text, re.I)
                         and not re.search(r'\b(MALE|FEMALE|TRANSGENDER)\b', english_text, re.I)
                         and not any(p in english_text.lower() for p in skip_patterns)
                         and has_reasonable_vowel_ratio(english_text)
@@ -673,7 +763,11 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
             if contains_devanagari(candidate) and not extract_english_only(candidate):
                 continue
 
-            english_text = extract_english_only(candidate)
+            # Strip leading OCR garbage so a name like "22 1 Roshan Vilas Yaday"
+            # (number prefix bleeding in from the card) is still recognised.
+            english_text = strip_leading_garbage(extract_english_only(candidate))
+            if looks_addressy(english_text):
+                continue
             if is_valid_name_candidate(english_text):
                 name = clean_name(english_text)
                 if name and len(name) >= 5:
@@ -978,10 +1072,16 @@ def _clean_and_deduplicate_address(address_parts: List[str], person_name: str = 
         if cleaned:
             cleaned_address_parts.append(cleaned)
 
-    # Filter out person name only (keep S/O, D/O etc. as part of address)
+    # Filter out the person's own name line (keep S/O, D/O etc. as part of address).
+    # Use normalized containment, not exact match, so a name line that picked up an
+    # OCR garbage prefix (e.g. "3o Parasa Naga Venkata Sai Manikanta") is still removed.
+    def _norm_name(s: str) -> str:
+        return re.sub(r'[^a-z0-9]', '', s.lower())
+    pn = _norm_name(person_name) if person_name else ""
     filtered = []
     for p in cleaned_address_parts:
-        if person_name and p.upper() == person_name.upper():
+        if (pn and len(pn) >= 6 and pn in _norm_name(p)
+                and not re.search(r'\b(S/O|D/O|W/O|C/O)\b', p, re.I)):
             continue
         filtered.append(p)
 
