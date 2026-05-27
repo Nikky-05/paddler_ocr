@@ -505,6 +505,14 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
         if re.search(r'\b(S/O|C/O|D/O|W/O|SON\s*OF|DAUGHTER\s*OF|WIFE\s*OF|CARE\s*OF)\b', text, re.I):
             return False
 
+        # Skip lines that begin with an address/locality label (e.g. "State Uttar
+        # Pradesh", "District Mainpuri", "VTC Tikuri", "PO Mota"). These are address
+        # lines, never the person's name, and would otherwise slip past the
+        # state-name check below because of the leading label word.
+        if re.match(r'^\s*(?:state|sub\s*-?\s*dist(?:rict)?|dist(?:rict)?|vtc|p\.?\s*o\.?|post|pin)\b',
+                    text, re.I):
+            return False
+
         # Skip if contains digits
         if re.search(r'\d', text):
             return False
@@ -824,7 +832,9 @@ def extract_name(lines: List[str], records: List[Dict], dob_idx: int, gender_idx
             # Case B: Name is on the line ABOVE S/O
             if i > 0:
                 candidate = lines[i - 1]
-                english_text = extract_english_only(candidate).strip()
+                # Strip leading OCR garbage so "$2}$ Sachin" -> "2 Sachin" -> "Sachin"
+                # is recognised instead of failing the digit/word checks below.
+                english_text = strip_leading_garbage(extract_english_only(candidate).strip())
                 # First try full validation (multi-word names)
                 if is_valid_name_candidate(english_text):
                     name = clean_name(english_text)
