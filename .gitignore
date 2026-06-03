@@ -68,3 +68,6 @@ $RECYCLE.BIN/
 # Misc temp/backup
 *.tmp
 *.bak
+
+# Clipboard / screenshot images auto-dumped with GUID names, e.g. {1C63...}.png
+{*}.png
