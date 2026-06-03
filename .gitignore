@@ -52,3 +52,19 @@ htmlcov/
 uploads/
 ocr/
 *.log
+
+# Scratch / local dev (not product code)
+bench_models.py
+# Keep local test/sample images out of the repo (and safe from cleanup tools)
+test_images/
+samples/
+
+# Windows OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Misc temp/backup
+*.tmp
+*.bak

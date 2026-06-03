@@ -44,7 +44,7 @@ OCR_STATUS = "not_loaded"  # "not_loaded", "loading", "ready", "failed"
 OCR_ERROR = None
 
 OLLAMA_HOST = (os.environ.get("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
-OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL") or "qwen3-vl:2b-instruct"
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL") or "qwen2.5vl:7b"
 
 # ============ Face Verification Setup ============
 UPLOAD_FOLDER = "uploads"

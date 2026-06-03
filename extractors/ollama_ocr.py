@@ -3,9 +3,15 @@ Vision-LLM document extraction via Ollama.
 
 This is the sole OCR/extraction engine: every uploaded document image is sent
 directly to a local vision-language model (served by Ollama, default
-``qwen3-vl:2b-instruct`` — a small, fast Qwen3-VL model) which reads the printed
-fields and returns them as JSON. There is no PaddleOCR / regex pipeline behind
-this — the model both "reads" the pixels and structures the result.
+``qwen2.5vl:7b``) which reads the printed fields and returns them as JSON. There
+is no PaddleOCR / regex pipeline behind this — the model both "reads" the pixels
+and structures the result.
+
+Hallucination control (production): besides the prompt (which tells the model to
+return "" rather than guess, and not to confuse the Enrolment No. with the
+Aadhaar number), every format-checkable field is validated after extraction
+(see _FIELD_VALIDATORS) and any value that fails its format is DROPPED, so a
+wrong Aadhaar/VID/DOB/PAN is never written into the response.
 
 The model is asked for the exact response field names used by ``main.py`` (name,
 dob, aadhaar, pan, ...). We then translate those into the ``extracted`` dict that
@@ -13,13 +19,14 @@ dob, aadhaar, pan, ...). We then translate those into the ``extracted`` dict tha
 
 Configuration (environment variables):
     OLLAMA_HOST           default "http://localhost:11434"
-    OLLAMA_VISION_MODEL   default "qwen3-vl:2b-instruct"
-                          NOTE: use the "-instruct" (non-thinking) variant. The
-                          plain "thinking" tags (e.g. qwen3-vl:2b / :8b) emit a
-                          long <think> block and ignore think=False; on the small
-                          2b model the reasoning alone exhausts num_predict, so
-                          the JSON answer is never produced and extraction returns
-                          nothing (HTTP 400 "does not match document type").
+    OLLAMA_VISION_MODEL   default "qwen2.5vl:7b"
+                          NOTE: use a non-thinking model. The "thinking" Qwen3-VL
+                          tags (e.g. qwen3-vl:2b / :8b) emit a long <think> block
+                          and ignore think=False; the reasoning can exhaust
+                          num_predict so the JSON answer is never produced and
+                          extraction returns nothing (HTTP 400 "does not match
+                          document type"). qwen2.5vl:7b and qwen3-vl:2b-instruct
+                          are both safe (non-thinking).
     LLM_TIMEOUT           default "150" (seconds)
     LLM_IMAGE_WIDTH       default "1100"
 """
@@ -34,6 +41,8 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from PIL import Image
 
+from .utils import validate_verhoeff, extract_english_only
+
 
 # ---------------------------------------------------------------------------
 # Configuration (environment variables)
@@ -45,7 +54,7 @@ def _env(name: str, default: str) -> str:
 
 
 OLLAMA_HOST = _env("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-OLLAMA_VISION_MODEL = _env("OLLAMA_VISION_MODEL", "qwen3-vl:2b-instruct")
+OLLAMA_VISION_MODEL = _env("OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
 LLM_TIMEOUT = float(_env("LLM_TIMEOUT", "150"))
 # KV-cache context size. With flash attention disabled the GPU may fail to
 # allocate large contexts, so we retry smaller (see _call_ollama).
@@ -58,6 +67,23 @@ LLM_IMAGE_WIDTH = int(_env("LLM_IMAGE_WIDTH", "1100"))
 # Max tokens to generate. Must cover qwen3-vl's hidden "thinking" tokens PLUS the
 # JSON answer (thinking alone can be ~800 tokens on a busy card).
 LLM_NUM_PREDICT = int(_env("LLM_NUM_PREDICT", "2048"))
+
+# --- Sampling / randomness controls ----------------------------------------
+# For OCR/KYC we want DETERMINISTIC, repeatable reads, so the defaults are the
+# most conservative possible: temperature 0 with a fixed seed => the model picks
+# the single most-likely token every time and the same image yields the same
+# JSON on every call. These are exposed as env vars so randomness CAN be dialled
+# up when wanted (e.g. LLM_TEMPERATURE=0.7 to let the model vary its output, or a
+# different LLM_SEED to sample a different deterministic path). Raising the
+# temperature increases hallucination risk, so keep it at 0 in production.
+#   LLM_TEMPERATURE  0.0  -> greedy/deterministic; higher = more random
+#   LLM_TOP_P        0.1  -> nucleus sampling cutoff (1.0 = consider all tokens)
+#   LLM_TOP_K        1    -> only the single most-likely token (0 = disabled)
+#   LLM_SEED         0    -> fixed RNG seed for reproducibility
+LLM_TEMPERATURE = float(_env("LLM_TEMPERATURE", "0"))
+LLM_TOP_P = float(_env("LLM_TOP_P", "0.1"))
+LLM_TOP_K = int(_env("LLM_TOP_K", "1"))
+LLM_SEED = int(_env("LLM_SEED", "0"))
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +130,20 @@ def _post_chat(img_b64: str, prompt: str, num_ctx: int) -> Optional[Dict]:
         # toward num_predict, so the cap must be high enough to fit BOTH the
         # reasoning and the answer — otherwise generation stops mid-think and
         # `content` comes back empty. 2048 leaves comfortable headroom.
-        "options": {"temperature": 0, "num_predict": LLM_NUM_PREDICT, "num_ctx": num_ctx},
+        # Sampling is env-controlled (see config block). With the defaults
+        # (temperature 0 + top_p 0.1 + top_k 1 + fixed seed) decoding is greedy and
+        # deterministic — the decoding-level guard against hallucination: the model
+        # picks the single most-likely token instead of "creatively" inventing a
+        # plausible digit, and repeats the exact same JSON on every call.
+        "options": {
+            "temperature": LLM_TEMPERATURE,
+            "top_p": LLM_TOP_P,
+            "top_k": LLM_TOP_K,
+            "seed": LLM_SEED,
+            "repeat_penalty": 1.0,
+            "num_predict": LLM_NUM_PREDICT,
+            "num_ctx": num_ctx,
+        },
     }
     resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=LLM_TIMEOUT)
     resp.raise_for_status()
@@ -158,7 +197,7 @@ _FIELD_HINTS = {
 
 # All fields to extract per document type.
 _DOC_FIELDS = {
-    "aadhaar": ["name", "dob", "aadhaar", "vid", "address", "father"],
+    "aadhaar": ["name", "dob", "gender", "aadhaar", "vid", "address", "father"],
     "pan": ["name", "pan", "dob", "father"],
     "driving_license": ["name", "dl_number", "dob", "address", "issue_date",
                         "validity", "blood_group", "cov", "father"],
@@ -183,11 +222,32 @@ _DOC_NOTES = {
         "The card is bilingual: a regional/Hindi (Devanagari etc.) line is usually",
         "followed by the same text in English. Always return the ENGLISH spelling of",
         "name and address.",
-        "Aadhaar number = 12 digits printed as 'XXXX XXXX XXXX'. If it is masked it",
-        "shows as 'XXXX XXXX 1234' — return it exactly as shown.",
-        "VID = 16 digits printed as four groups of four.",
+        "CRITICAL — do NOT confuse these two different numbers:",
+        "  * 'Enrolment No.' / 'Enrolment Number' is printed near the TOP as",
+        "    'NNNN/NNNNN/NNNNN' (it contains slashes). This is NOT the Aadhaar",
+        "    number. NEVER put it in the 'aadhaar' field — leave 'aadhaar' empty",
+        "    rather than use the Enrolment No.",
+        "  * The 'aadhaar' field is the 12-digit Aadhaar number near 'Your Aadhaar",
+        "    No.' / the holder's photo. It is USUALLY printed in FULL as",
+        "    'NNNN NNNN NNNN' — read and return all 12 digits exactly. ONLY if the",
+        "    first 8 digits are actually hidden behind X/* masking, return the masked",
+        "    form 'XXXX XXXX 1234' as shown. Never output 'X' for digits that ARE",
+        "    printed, and never leave this empty when a 12-digit number is visible.",
+        "VID = exactly 16 digits printed as four groups of four (labelled 'VID').",
+        "  Read all 16 digits and return them; only return '' if no VID is printed.",
+        "name = the person's name in English near the photo. father = the name",
+        "  after an 'S/O' / 'C/O' / 'D/O' marker in the address; if there is no such",
+        "  marker, return '' for father (do NOT repeat the holder's own name).",
         "DOB may be labelled 'DOB' or 'Year of Birth' (then only a year is present).",
         "Gender appears as MALE / FEMALE / पुरुष / महिला.",
+        "address — THIS IS MANDATORY. Read the COMPLETE postal address block and",
+        "  return it as ONE single line (join the printed lines with ', '). It",
+        "  almost ALWAYS begins with a relationship line — 'S/O' (son of), 'D/O'",
+        "  (daughter of), 'W/O' (wife of) or 'C/O' (care of) followed by a name —",
+        "  which you MUST include as the start of the address. Then read every",
+        "  following line: house/area, VTC or village, PO, sub-district, district,",
+        "  state, and the 6-digit PIN code, EXACTLY as printed. Do NOT skip the",
+        "  first lines and do NOT start in the middle of the address.",
     ],
     "pan": [
         "PAN is EXACTLY 10 characters: 5 letters, 4 digits, then 1 letter",
@@ -257,22 +317,34 @@ _ADDR_STOP = re.compile(
 # Father's-name derivation (Indian IDs rarely print it as its own field)
 # ---------------------------------------------------------------------------
 
-def _father_from_address(address: str) -> str:
-    """Pull a father's name from an Aadhaar-style relation marker at the start of
-    the address: "S/O <name>", "C/O <name>", "D/O <name>" (son/care/daughter of).
-    Returns the name up to the first address keyword/comma, or "" if not found."""
+def _relation_from_address(address: str) -> Tuple[str, str]:
+    """Parse an Aadhaar relation marker at the start of the address.
+
+    Returns (kind, name):
+      * kind == "father"  for S/O (son of), D/O (daughter of), C/O (care of)
+      * kind == "husband" for W/O (wife of)
+      * ("", "") when no relation marker is present.
+    The name is taken up to the first comma or address keyword.
+    """
     if not address:
-        return ""
-    m = re.search(r'\b([SCD])\s*[/.]?\s*[O0]\b[:\-\s]+(.+)', address, re.I)
+        return "", ""
+    m = re.search(r'\b([SCDW])\s*[/.]?\s*[O0]\b[:\-\s]+(.+)', address, re.I)
     if not m:
-        return ""
-    rest = m.group(2)
-    # Cut at the first comma or address keyword.
-    rest = re.split(r',', rest, 1)[0]
+        return "", ""
+    kind = "husband" if m.group(1).upper() == "W" else "father"
+    rest = re.split(r',', m.group(2), 1)[0]
     stop = _ADDR_STOP.search(rest)
     if stop:
         rest = rest[:stop.start()]
-    return " ".join(rest.split()).strip(" ,-")
+    name = " ".join(rest.split()).strip(" ,-")
+    return (kind, name) if name else ("", "")
+
+
+def _father_from_address(address: str) -> str:
+    """Back-compat shim: return the relation name only when it is a father-type
+    marker (S/O, D/O, C/O). Used by the non-Aadhaar document fallbacks."""
+    kind, name = _relation_from_address(address)
+    return name if kind == "father" else ""
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +377,13 @@ def _build_prompt(doc_type: str) -> str:
         "Rules:",
         "- Transcribe Latin characters exactly as printed. Do not translate.",
         '- If a field is genuinely not visible/readable, return an empty string "".',
-        "- Do not invent or guess values.",
+        "- It is BETTER to return an empty string than a guessed or partial value.",
+        "  Never fill a field with a value taken from a DIFFERENT field/label.",
+        "- Do not invent, complete, or 'fix' values. Return only what you can read.",
         "- Numbers (Aadhaar, VID, PAN, EPIC, passport, DL) must be transcribed digit-for-digit.",
+        "  Do not guess digits you cannot see. For a MASKED number, return the visible",
+        "  digits together with the printed mask exactly (e.g. 'XXXX XXXX 1234') — that",
+        "  is a complete, valid answer, not an uncertain one.",
         "- Output JSON only.",
     ]
     return "\n".join(lines)
@@ -329,8 +406,224 @@ def _query_model(img: Image.Image, doc_type: str, max_width: int) -> Optional[Di
         return None
 
 
+# ---------------------------------------------------------------------------
+# Per-field validators (anti-hallucination guard)
+# ---------------------------------------------------------------------------
+# A vision model on a low-res ID will sometimes return a confident-but-WRONG
+# value — most dangerously it grabs the "Enrolment No." (NNNN/NNNNN/NNNNN) and
+# returns it as the Aadhaar number. Every field below has a deterministic,
+# checkable format, so we VALIDATE the model's answer and DROP anything that
+# doesn't fit. Dropping a field (-> empty in the response) is always safer than
+# emitting a wrong identifier. Each validator returns the cleaned/normalised
+# string, or "" to signal "reject — do not append".
+
+def _digits(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+
+def _clean_aadhaar_number(val: str) -> str:
+    """Accept ONLY a real Aadhaar number; reject Enrolment No. / wrong lengths.
+
+    Valid forms:
+      * Fully printed 12 digits that PASS the Verhoeff checksum -> "NNNN NNNN NNNN"
+      * Masked card form (8 hidden + last 4 visible)            -> "XXXX XXXX NNNN"
+    Everything else (Enrolment 'NNNN/NNNNN/NNNNN', 14-digit blobs, partials,
+    checksum failures) returns "" so it is never written to the response.
+    """
+    if not val:
+        return ""
+    s = val.strip()
+    # Enrolment numbers contain a slash and are never the Aadhaar number.
+    if "/" in s:
+        return ""
+    digs = _digits(s)
+    mask_count = len(re.findall(r"[Xx*•]", s))  # X, x, *, • used for masking
+    # Fully visible 12-digit Aadhaar -> must satisfy the Verhoeff check digit.
+    if mask_count == 0 and len(digs) == 12:
+        return f"{digs[0:4]} {digs[4:8]} {digs[8:12]}" if validate_verhoeff(digs) else ""
+    # Masked print: exactly the last 4 digits visible, the first 8 hidden.
+    if len(digs) == 4 and mask_count >= 6:
+        return f"XXXX XXXX {digs}"
+    return ""
+
+
+def _clean_vid(val: str) -> str:
+    """VID is EXACTLY 16 digits. Anything else is a misread -> reject."""
+    digs = _digits(val)
+    if len(digs) == 16:
+        return f"{digs[0:4]} {digs[4:8]} {digs[8:12]} {digs[12:16]}"
+    return ""
+
+
+def _clean_dob(val: str) -> str:
+    """Accept DD/MM/YYYY (with sane ranges) or a bare 4-digit year of birth."""
+    if not val:
+        return ""
+    s = val.strip()
+    m = re.search(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b", s)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12 and 1900 <= y <= 2100:
+            return f"{d:02d}/{mo:02d}/{y:04d}"
+        return ""
+    m2 = re.fullmatch(r"(\d{4})", s)
+    if m2 and 1900 <= int(m2.group(1)) <= 2100:
+        return m2.group(1)
+    return ""
+
+
+def _clean_pan(val: str) -> str:
+    """PAN = 5 letters + 4 digits + 1 letter (ABCDE1234F). Else reject."""
+    s = re.sub(r"\s", "", val or "").upper()
+    return s if re.fullmatch(r"[A-Z]{5}\d{4}[A-Z]", s) else ""
+
+
+def _clean_gender(val: str) -> str:
+    """Normalise gender to MALE / FEMALE / TRANSGENDER (handles Hindi + 'M'/'F').
+    Anything unrecognised is rejected so no garbage lands in the field."""
+    if not val:
+        return ""
+    s = val.strip().lower()
+    if "female" in s or "महिला" in val or s in ("f", "स्त्री"):
+        return "FEMALE"
+    if "transgender" in s or "trans" in s or "किन्नर" in val:
+        return "TRANSGENDER"
+    if "male" in s or "पुरुष" in val or s == "m":
+        return "MALE"
+    return ""
+
+
+def _clean_person_name(val: str) -> str:
+    """Keep a plausible Latin-script person name; strip Devanagari/digits/noise.
+
+    Does NOT hard-reject misreads (a name has no checksum) — it only removes
+    obvious non-name characters so we never append digits or Hindi glyphs into
+    a name field. Returns "" only when nothing name-like remains.
+    """
+    if not val:
+        return ""
+    s = extract_english_only(val)              # drop non-ASCII (Devanagari) glyphs
+    # Strip relationship markers (S/O, C/O, D/O, W/O) — they are not part of the
+    # name. Without this, a model that returns "S/O" leaks "S O" into the field.
+    s = re.sub(r"(?i)\b[scdw]\s*[/.]?\s*o\b", " ", s)
+    s = re.sub(r"[^A-Za-z .'\-]", " ", s)       # keep letters + name punctuation
+    words = [w for w in s.split() if w]
+    # A real name has at least one word of 2+ letters; this rejects stray
+    # single-letter noise like "S O" while still allowing initials ("A Kumar").
+    if not any(len(w) >= 2 for w in words):
+        return ""
+    return " ".join(words)
+
+
+# Map response key -> the validator that must approve its value.
+_FIELD_VALIDATORS = {
+    "aadhaar_number": _clean_aadhaar_number,
+    "vid": _clean_vid,
+    "dob": _clean_dob,
+    "pan_number": _clean_pan,
+    "gender": _clean_gender,
+}
+_NAME_KEYS = {"name", "father_name", "mother_name", "husband_name", "spouse_name"}
+
+
+# A focused, single-purpose prompt. The big multi-field Aadhaar prompt sometimes
+# makes the model skip the large bold Aadhaar number (it reads the smaller VID
+# right below it but not the number itself). Asking for ONLY the number/VID, with
+# no other fields competing for attention, reliably recovers it.
+_AADHAAR_NUM_PROMPT = (
+    "This is an Indian Aadhaar card. Near the label 'Your Aadhaar No.' a large "
+    "12-digit Aadhaar number is printed as 'NNNN NNNN NNNN' (occasionally masked "
+    "as 'XXXX XXXX 1234'). Just below it a 16-digit 'VID' may be printed as four "
+    "groups of four. Read them EXACTLY, digit for digit. Return ONLY this JSON: "
+    '{"aadhaar": "<the 12-digit number>", "vid": "<the 16-digit VID>"}. '
+    "If a value is genuinely not visible, return an empty string for it."
+)
+
+
+def _recover_aadhaar_numbers(img: Image.Image) -> Dict[str, str]:
+    """Focused second call to read the Aadhaar number / VID that the big
+    multi-field prompt sometimes skips. Returns a dict with validated
+    'aadhaar_number' and/or 'vid' only (same anti-hallucination gates), or {}."""
+    try:
+        b64 = _image_to_b64(img, max_width=1400)
+        r = _call_ollama(b64, _AADHAAR_NUM_PROMPT)
+    except Exception as e:  # noqa: BLE001 - never break the request
+        print(f"[DEBUG] Aadhaar number recovery error: {e}")
+        return {}
+    out: Dict[str, str] = {}
+    if isinstance(r, dict):
+        a = _clean_aadhaar_number(str(r.get("aadhaar") or ""))
+        if a:
+            out["aadhaar_number"] = a
+        v = _clean_vid(str(r.get("vid") or ""))
+        if v:
+            out["vid"] = v
+    return out
+
+
+# Focused address recovery. The full postal address (incl. the leading S/O|D/O|
+# W/O|C/O relation line) is occasionally skipped or truncated by the big prompt.
+_ADDRESS_PROMPT = (
+    "This is an Indian Aadhaar card. Read the holder's FULL postal address EXACTLY "
+    "as printed, as ONE single line (join the printed lines with ', '). It almost "
+    "always STARTS with a relationship line — 'S/O' (son of), 'D/O' (daughter of), "
+    "'W/O' (wife of) or 'C/O' (care of) followed by a name — then house/area, VTC "
+    "or village, PO, sub-district, district, state and the 6-digit PIN. Include "
+    "EVERY part, especially that first relationship line; never start in the "
+    'middle. Return ONLY this JSON: {"address": "<the full address>"}. If no '
+    'address is printed at all, return "".'
+)
+
+# Focused relation/father recovery. Asks ONLY about the relation line, and is
+# explicitly allowed to return empty — so a card with no S/O|D/O|W/O|C/O (where
+# the holder genuinely has no parent/spouse printed) is not forced to fabricate.
+_RELATION_PROMPT = (
+    "This is an Indian Aadhaar card. Look ONLY for a relationship line in the "
+    "address that starts with 'S/O', 'D/O', 'W/O' or 'C/O' followed by a person's "
+    "name (a parent's or husband's name — NOT the cardholder's own name). Return "
+    'ONLY this JSON: {"relation": "<S/O|D/O|W/O|C/O or empty>", "name": "<the name '
+    'after it, or empty>"}. If there is genuinely NO such relationship line, return '
+    "empty strings for both."
+)
+
+
+def _recover_address(img: Image.Image) -> str:
+    """Focused call to read the full postal address. Returns a single-line address
+    or "" — never raises."""
+    try:
+        b64 = _image_to_b64(img, max_width=1400)
+        r = _call_ollama(b64, _ADDRESS_PROMPT)
+    except Exception as e:  # noqa: BLE001 - never break the request
+        print(f"[DEBUG] Aadhaar address recovery error: {e}")
+        return ""
+    if isinstance(r, dict) and isinstance(r.get("address"), str):
+        return " ".join(r["address"].split())
+    return ""
+
+
+def _recover_relation(img: Image.Image) -> Tuple[str, str]:
+    """Focused call to read the relation marker + name. Returns (kind, name) where
+    kind is 'father' (S/O|D/O|C/O), 'husband' (W/O), or '' when none is printed."""
+    try:
+        b64 = _image_to_b64(img, max_width=1400)
+        r = _call_ollama(b64, _RELATION_PROMPT)
+    except Exception as e:  # noqa: BLE001 - never break the request
+        print(f"[DEBUG] Aadhaar relation recovery error: {e}")
+        return "", ""
+    if not isinstance(r, dict):
+        return "", ""
+    rel = str(r.get("relation") or "").strip().upper()
+    name = _clean_person_name(str(r.get("name") or ""))
+    if not name:
+        return "", ""
+    kind = "husband" if rel.startswith("W") else "father" if rel[:1] in ("S", "D", "C") else ""
+    return (kind, name) if kind else ("", "")
+
+
 def _result_to_extracted(result: Dict, fields: List[str], doc_type: str) -> Dict[str, str]:
-    """Map the model's JSON onto the keys create_uniform_response expects."""
+    """Map the model's JSON onto the keys create_uniform_response expects,
+    validating each field's format and DROPPING anything that doesn't fit so no
+    wrong/hallucinated value is ever written into the response."""
     extracted: Dict[str, str] = {}
     for f in fields:
         val = result.get(f)
@@ -341,11 +634,21 @@ def _result_to_extracted(result: Dict, fields: List[str], doc_type: str) -> Dict
             # line fields (esp. the Aadhaar address, which is printed across
             # several lines) come back as one clean exact line — no "\n" artifacts.
             val = " ".join(val.split())
+            if not val:
+                continue
+            key = _EXTRACTED_KEY.get(f, f)
+            # Passport stores spouse name under spouse_name, not husband_name.
+            if doc_type == "passport" and f == "husband":
+                key = "spouse_name"
+
+            # Format-checked fields: reject the whole value if it fails.
+            validator = _FIELD_VALIDATORS.get(key)
+            if validator is not None:
+                val = validator(val)
+            elif key in _NAME_KEYS:
+                val = _clean_person_name(val)
+
             if val:
-                key = _EXTRACTED_KEY.get(f, f)
-                # Passport stores spouse name under spouse_name, not husband_name.
-                if doc_type == "passport" and f == "husband":
-                    key = "spouse_name"
                 extracted[key] = val
     return extracted
 
@@ -408,44 +711,93 @@ def extract_document(img: Image.Image, doc_type: str) -> Tuple[Dict, Optional[st
     if not fields:
         return {}, None
 
-    # Attempt order. A full e-Aadhaar "letter" is a portrait A4 page whose right
-    # half is a dense bilingual INFORMATION panel; feeding the whole page makes
-    # the model overthink and return nothing. For such portrait Aadhaar pages,
-    # read the LEFT column (where all the real data lives) at higher zoom first,
-    # then fall back to the full image for normal single-card scans.
+    # Attempt strategy + MERGE. Two e-Aadhaar layouts need different framing:
+    #   * Two-column "letter": the right half is a dense bilingual INFORMATION
+    #     panel — reading the LEFT column avoids the model drowning in that text.
+    #   * Single-column "letter": the Aadhaar number, VID and full address are
+    #     printed CENTERED, so a left-column crop slices straight through them.
+    # We can't tell the two apart reliably from the aspect ratio alone, so for a
+    # portrait Aadhaar we read BOTH the full image and the left column and MERGE:
+    # for each field we keep the first VALIDATED, non-empty value (full image
+    # first, because it sees the centered number band and the complete address).
+    # The left-column pass then only fills fields the full pass missed. This is
+    # why a single blind crop used to lose the Aadhaar number / VID / DOB.
     attempts = [(img, LLM_IMAGE_WIDTH)]
     if doc_type == "aadhaar" and img.height > img.width * 1.15:
         w, h = img.size
         left = img.crop((0, 0, int(w * 0.55), h))
-        attempts = [(left, 1400), (img, LLM_IMAGE_WIDTH)]
+        attempts = [(img, 1400), (left, 1400)]
+
+    # All high-value fields we'd like before we can stop early.
+    _core = ("name", "dob", "aadhaar_number", "vid", "address")
 
     result: Optional[Dict] = None
     extracted: Dict[str, str] = {}
     for im, width in attempts:
-        result = _query_model(im, doc_type, width)
-        if result is not None:
-            extracted = _result_to_extracted(result, fields, doc_type)
-            if extracted:
-                break
+        r = _query_model(im, doc_type, width)
+        if r is None:
+            continue
+        if result is None:
+            result = r  # keep the first usable raw dict for document_type detection
+        part = _result_to_extracted(r, fields, doc_type)
+        for k, v in part.items():
+            # First validated, non-empty value wins (earlier attempt = higher trust).
+            if v and not extracted.get(k):
+                extracted[k] = v
+        # Stop once every core field is in hand — no need to run the extra pass.
+        if all(extracted.get(k) for k in _core):
+            break
 
     if not extracted:
         return {}, None
+
+    # The large bold Aadhaar number is the one field the multi-field prompt most
+    # often skips. If it's still missing, make ONE focused call that asks only for
+    # the number (and VID) — cheap, fires only on a miss, and validated the same way.
+    if doc_type == "aadhaar" and not extracted.get("aadhaar_number"):
+        for k, v in _recover_aadhaar_numbers(img).items():
+            extracted.setdefault(k, v)
+
+    # Address is MANDATORY on an Aadhaar. If the main passes missed it (e.g. the
+    # model started in the middle or skipped the block), re-read it with a focused
+    # address-only prompt before we derive the father from it.
+    if doc_type == "aadhaar" and not extracted.get("address"):
+        addr = _recover_address(img)
+        if addr:
+            extracted["address"] = addr
 
     # Father's name. Indian IDs (esp. Aadhaar) do NOT print a dedicated "Father's
     # Name" field, so the vision model often leaves it empty or — worse — just
     # echoes the holder's OWN name back. Resolve it deterministically:
     #   1) Drop a model value that merely repeats the holder's name (a misread).
-    #   2) Otherwise take it from the "S/O <name>" (son of) / "C/O" / "D/O" marker
-    #      printed at the start of the address, e.g. "S/O: Umashankar" -> "Umashankar".
-    #   3) If neither yields a real name, leave the field EMPTY — never guess it
-    #      from the holder's own name.
+    #   2) Otherwise take it from the "S/O <name>" (son of) / "C/O" / "D/O" / "W/O"
+    #      marker in the address (W/O routes to husband, not father).
+    #   3) If still nothing, make ONE focused relation-only call (which is allowed
+    #      to return empty, so a card with no parent/spouse is not forced to guess).
     if "father" in fields:
-        name_norm = (extracted.get("name") or "").strip().lower()
-        father = (extracted.get("father_name") or "").strip()
-        if father.lower() == name_norm:
-            father = ""
-        if not father:
-            father = _father_from_address(extracted.get("address", ""))
+        if doc_type == "aadhaar":
+            # An Aadhaar card has NO dedicated father field, so the only reliable
+            # source is the relation marker in the address. Ignore whatever the
+            # model put in "father" (it tends to echo the holder's own surname).
+            kind, rel_name = _relation_from_address(extracted.get("address", ""))
+            if not kind:
+                # Focused fallback — the address may have been truncated before the
+                # relation line, or it's a W/O the inline read dropped.
+                kind, rel_name = _recover_relation(img)
+            if kind == "husband":
+                extracted["husband_name"] = rel_name
+                father = ""
+            else:
+                father = rel_name if kind == "father" else ""
+        else:
+            name_norm = (extracted.get("name") or "").strip().lower()
+            father = (extracted.get("father_name") or "").strip()
+            # Drop a value that merely repeats (or is contained in) the holder's
+            # own name — that's a misread, not the father.
+            if father and (father.lower() == name_norm or father.lower() in name_norm):
+                father = ""
+            if not father:
+                father = _father_from_address(extracted.get("address", ""))
         if father:
             extracted["father_name"] = father
         else:
