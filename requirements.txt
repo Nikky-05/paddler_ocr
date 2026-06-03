@@ -1,13 +1,16 @@
 fastapi>=0.95
 uvicorn[standard]>=0.22
-paddleocr==3.3.2
-paddlepaddle==3.2.2
+# OCR/extraction is performed by a local Ollama vision model (qwen2.5vl:7b) via
+# its HTTP API (see `requests` below) — no on-device OCR engine is required.
 numpy>=1.24
 Pillow>=9.0
 python-multipart>=0.0.6
+# torch/torchvision power face detection (facenet-pytorch). CPU build is fine;
+# install from the CPU index if you don't need GPU:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
 facenet-pytorch
 werkzeug
 PyMuPDF>=1.23
-langchain==0.0.352
+requests>=2.31  # talks to the Ollama vision model over HTTP

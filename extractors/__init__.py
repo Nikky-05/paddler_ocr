@@ -1,25 +1,13 @@
 """
 Indian Identity Document Extractors
-Modular OCR extraction logic for different document types.
+
+On this branch the Ollama vision model (``ollama_ocr.py``) is the sole OCR /
+extraction engine. The only shared helper still needed at package level is
+``split_address``; everything else lives in ``ollama_ocr`` / ``utils``.
 """
 
-from .aadhaar import extract_aadhaar
-from .driving_license import extract_driving_license
-from .pan import extract_pan
-from .voter import extract_voter
-from .passport import extract_passport
-from .kyc_report import is_kyc_report, extract_kyc_report
-from .utils import mergeOcrIntoResponse, split_address
+from .utils import split_address
 
 __all__ = [
-    'extract_aadhaar',
-    'extract_driving_license',
-    'extract_pan',
-    'extract_voter',
-    'extract_passport',
-    'is_kyc_report',
-    'extract_kyc_report',
-    'mergeOcrIntoResponse',
     'split_address',
 ]
-
