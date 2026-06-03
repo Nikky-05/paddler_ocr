@@ -36,8 +36,6 @@ def _clean_label(s: Optional[str]) -> str:
     return s.strip()
 
 
-# def _normalize_ordinal(s: str) -> str:
-#     return re.sub(r'(\d)\s+(st|nd|rd|th)', r'\1\2', s, flags=re.I)
 def _normalize_ordinal(s: str) -> str:
     # Handle fully split: OCR may read "31st" as "3 1 st"
     s = re.sub(r'(\d)\s+(\d)\s+(st|nd|rd|th)', r'\1\2\3', s, flags=re.I)
