@@ -1120,11 +1120,17 @@ os.environ['FLAGS_use_mkldnn'] = '0'
 os.environ['MKLDNN_VERBOSE'] = '0'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
+# Initialize logging before other imports
+from logging_config import setup_logging, get_logger, LOG_DIR
+setup_logging()
+logger = get_logger("main")
+
 import asyncio
 import base64
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime as dt, date as date_cls
 from io import BytesIO
 from typing import Dict, List, Optional
 
@@ -1169,11 +1175,11 @@ async def load_ocr_model():
         loop = asyncio.get_event_loop()
         OCR = await loop.run_in_executor(None, _init_ocr)
         OCR_STATUS = "ready"
-        print("OCR model loaded successfully")
+        logger.info("OCR model loaded successfully")
     except Exception as e:
         OCR_STATUS = "failed"
         OCR_ERROR = str(e)
-        print(f"Failed to load OCR model: {e}")
+        logger.error(f"Failed to load OCR model: {e}", exc_info=True)
 
 
 def _init_ocr():
@@ -1519,7 +1525,7 @@ def ocr_records_from_image(img: Image.Image, doc_type: str = None) -> List[Dict]
             if any(k in full_text for k in keywords) and avg_conf > 0.80:
                 return merge_results(results)
     except Exception as e:
-        print(f"[DEBUG] OCR Pass 1 error: {e}")
+        logger.debug(f"OCR Pass 1 error: {e}")
 
     # Pass 2: Preprocessed image
     try:
@@ -1537,7 +1543,7 @@ def ocr_records_from_image(img: Image.Image, doc_type: str = None) -> List[Dict]
         parsed2 = run_ocr(np.array(img_pass2))
         results.extend(parsed2)
     except Exception as e:
-        print(f"[DEBUG] OCR Pass 2 error: {e}")
+        logger.debug(f"OCR Pass 2 error: {e}")
 
     # Pass 3 (PAN-specific): Grayscale + binarization for cleaner text recognition
     # PAN cards often have low-contrast text that benefits from thresholding
@@ -1560,7 +1566,7 @@ def ocr_records_from_image(img: Image.Image, doc_type: str = None) -> List[Dict]
             parsed3 = run_ocr(np.array(img_pass3))
             results.extend(parsed3)
         except Exception as e:
-            print(f"[DEBUG] OCR Pass 3 (PAN binarization) error: {e}")
+            logger.debug(f"OCR Pass 3 (PAN binarization) error: {e}")
 
     return merge_results(results)
 
@@ -1592,7 +1598,8 @@ def merge_results(results: List[Dict]) -> List[Dict]:
         ordered.append({
             'text': merged_text,
             'conf': avg_conf,
-            'y': b
+            'y': b,
+            'items': items_sorted,  # preserve individual OCR boxes with x positions
         })
 
     # Merge tiny fragments
@@ -1603,10 +1610,12 @@ def merge_results(results: List[Dict]) -> List[Dict]:
         if buffer and len(buffer['text']) < 8 and re.match(r'^[A-Za-z]+$', ln.replace(' ', '')):
             buffer['text'] = buffer['text'] + ' ' + ln
             buffer['conf'] = max(buffer.get('conf', 0.0), rec.get('conf', 0.0))
+            buffer.setdefault('items', []).extend(rec.get('items', []))
         else:
             if buffer:
                 merged.append(buffer)
-            buffer = dict(text=ln, conf=rec.get('conf', 0.0), y=rec.get('y', 0))
+            buffer = dict(text=ln, conf=rec.get('conf', 0.0), y=rec.get('y', 0),
+                          items=rec.get('items', []))
     if buffer:
         merged.append(buffer)
 
@@ -1790,7 +1799,7 @@ def detect_face_in_document(img: Image.Image) -> dict:
             face_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
             return {"faceDetected": True, "faceImage": face_b64}
     except Exception as e:
-        print(f"[DEBUG] Face detection error: {e}")
+        logger.debug(f"Face detection error: {e}")
     return {"faceDetected": False, "faceImage": ""}
 
 
@@ -1897,35 +1906,17 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
             detail="Invalid Document"
         )
 
-    # For Aadhaar back side: crop left column to remove bilingual overlap
-    # The back side has English (left) and Hindi (right) in parallel columns.
-    # OCR merges both columns at the same y-position, creating garbage text.
-    # Cropping isolates the English column for clean extraction.
-    aadhaar_back_full_text = None
-    aadhaar_back_full_lines = None
+    # For Aadhaar back side: use full image OCR, extraction handles
+    # English-only filtering dynamically for both column and stacked layouts
+    aadhaar_is_back = False
     if doc_type == 'aadhaar':
         from extractors.aadhaar import is_aadhaar_back_side
         if is_aadhaar_back_side(lines, text):
-            # Save full-image data for Aadhaar number fallback
-            aadhaar_back_full_text = text
-            aadhaar_back_full_lines = lines[:]
-            # Crop left ~52% of image to get English-only text
-            w, h = img.size
-            left_img = img.crop((0, 0, int(w * 0.52), h))
-            records = ocr_records_from_image(left_img, doc_type)
-            lines = [r['text'] for r in records]
-            text = "\n".join(lines)
+            aadhaar_is_back = True
 
     # Extract based on document type
     if doc_type == 'aadhaar':
         extracted = extract_aadhaar(lines, text, records)
-        # Fallback: if back side and Aadhaar number not found in cropped image,
-        # use the number from the full image (the crop may cut the centered number)
-        if aadhaar_back_full_text and not extracted.get('aadhaar_number'):
-            from extractors.aadhaar import extract_aadhaar_number
-            extracted['aadhaar_number'] = extract_aadhaar_number(
-                aadhaar_back_full_text, aadhaar_back_full_lines
-            )
     elif doc_type == 'pan':
         extracted = extract_pan(lines, text, records)
     elif doc_type == 'driving_license':
@@ -1958,11 +1949,11 @@ async def process_document(file: UploadFile, doc_type_code: str) -> Dict:
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     # Startup: Load OCR model
-    print("Starting OCR model loading...")
+    logger.info("Starting OCR model loading...")
     await load_ocr_model()
     yield
     # Shutdown: Cleanup if needed
-    print("Shutting down...")
+    logger.info("Shutting down...")
 
 
 app = FastAPI(
@@ -1979,6 +1970,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every incoming request and its response status."""
+    logger.info(f"Request: {request.method} {request.url.path}")
+    response = await call_next(request)
+    level = logger.error if response.status_code >= 500 else logger.info
+    level(f"Response: {request.method} {request.url.path} -> {response.status_code}")
+    return response
 
 
 class HealthResponse(BaseModel):
@@ -2042,7 +2043,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     """Catch-all for internal server errors."""
-    print(f"INTERNAL ERROR: {str(exc)}")
+    logger.error(f"Internal server error: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content=ErrorResponse(
@@ -2185,6 +2186,105 @@ async def verify_faces(
         threshold=threshold,
         percent_similarity=percent
     )
+
+
+_LOG_LINE_RE = re.compile(
+    r'^\[(?P<timestamp>[^\]]+)\]\s+(?P<level>\w+)\s+\[(?P<module>[^\]]+)\]\s+(?P<message>.*)$'
+)
+
+
+def _parse_log_lines(raw: str) -> List[Dict]:
+    """Parse raw log text into structured entries."""
+    entries = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _LOG_LINE_RE.match(line)
+        if m:
+            entries.append({
+                "timestamp": m.group("timestamp"),
+                "level": m.group("level"),
+                "module": m.group("module"),
+                "message": m.group("message"),
+            })
+        elif entries:
+            # continuation line — append to last entry's message
+            entries[-1]["message"] += "\n" + line
+    return entries
+
+
+def _summarize_logs(entries: List[Dict]) -> Dict:
+    """Build summary counts from parsed entries."""
+    total = len(entries)
+    errors = sum(1 for e in entries if e["level"] == "ERROR")
+    warnings = sum(1 for e in entries if e["level"] == "WARNING")
+    requests = sum(1 for e in entries if "Request:" in e["message"])
+    responses_ok = sum(1 for e in entries if "-> 200" in e["message"])
+    responses_err = sum(
+        1 for e in entries
+        if e["module"] == "main" and "Response:" in e["message"] and "-> 200" not in e["message"]
+    )
+    return {
+        "total_entries": total,
+        "errors": errors,
+        "warnings": warnings,
+        "requests": requests,
+        "success_responses": responses_ok,
+        "error_responses": responses_err,
+    }
+
+
+@app.get("/logs/{date:path}")
+async def get_logs(date: str):
+    """
+    Retrieve structured logs for a specific date.
+
+    Date format: DD/MM/YYYY or DD/MM/YY
+    Examples: /logs/23/03/2026, /logs/23/03/26
+    """
+    parts = date.strip("/").split("/")
+    if len(parts) != 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date format. Use DD/MM/YYYY or DD/MM/YY (e.g. /logs/23/03/2026)",
+        )
+
+    day, month, year = parts
+    if len(year) == 2:
+        year = "20" + year
+
+    try:
+        target = dt.strptime(f"{day}/{month}/{year}", "%d/%m/%Y")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date. Use DD/MM/YYYY or DD/MM/YY",
+        )
+
+    # Today's logs are in app.log; older logs in app_YYYY-MM-DD.log
+    if target.date() == date_cls.today():
+        log_path = os.path.join(LOG_DIR, "app.log")
+    else:
+        log_path = os.path.join(LOG_DIR, f"app_{target.strftime('%Y-%m-%d')}.log")
+
+    if not os.path.exists(log_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No logs found for {day}/{month}/{year}",
+        )
+
+    with open(log_path, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    entries = _parse_log_lines(raw)
+    summary = _summarize_logs(entries)
+
+    return {
+        "date": f"{day}/{month}/{year}",
+        "summary": summary,
+        "logs": entries,
+    }
 
 
 if __name__ == "__main__":

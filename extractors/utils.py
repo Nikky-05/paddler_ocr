@@ -177,6 +177,12 @@ def clean_ocr_garbage(s: str) -> str:
             
         # Keep words that look like parts of a name
         if (word[0].isupper() and word.isalpha()) or (word.isupper() and len(word) >= 2 and word.isalpha()):
+            # Filter out all-uppercase garbage fragments with poor vowel ratio
+            # e.g. "JTUTR", "HRG", "BKLT" — not real name words
+            if word.isupper() and len(word) >= 3:
+                vowels = sum(1 for c in word if c in "AEIOUY")
+                if vowels / len(word) < 0.25:
+                    continue
             cleaned_words.append(word)
     return ' '.join(cleaned_words)
 

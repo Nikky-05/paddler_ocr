@@ -12,6 +12,8 @@ Handles:
 import re
 from typing import Dict, List
 from .utils import nearest_line
+from logging_config import get_logger
+logger = get_logger("passport")
 
 
 def extract_passport(lines: List[str], text: str) -> Dict:
@@ -29,10 +31,10 @@ def extract_passport(lines: List[str], text: str) -> Dict:
         "spouse_name": ""
     }
 
-    print("\n[DEBUG] ===== Passport Extraction Started =====")
-    print(f"[DEBUG] Total OCR lines: {len(lines)}")
+    logger.debug("===== Passport Extraction Started =====")
+    logger.debug(f"Total OCR lines: {len(lines)}")
     for i, ln in enumerate(lines[:30]):
-        print(f"[DEBUG]   Line {i}: '{ln}'")
+        logger.debug(f"  Line {i}: '{ln}'")
 
     # =========================================================================
     # MRZ Strategy - parse both MRZ lines
@@ -59,8 +61,8 @@ def extract_passport(lines: List[str], text: str) -> Dict:
                 line2 = cleaned
                 break
 
-    print(f"[DEBUG] MRZ Line 1: {line1}")
-    print(f"[DEBUG] MRZ Line 2: {line2}")
+    logger.debug(f"MRZ Line 1: {line1}")
+    logger.debug(f"MRZ Line 2: {line2}")
 
     # Parse MRZ line 1 -> name
     if line1:
@@ -72,7 +74,7 @@ def extract_passport(lines: List[str], text: str) -> Dict:
             full_name = f"{given_name} {surname}".strip()
             if full_name:
                 obj['name'] = full_name
-                print(f"[DEBUG] Name from MRZ: {obj['name']}")
+                logger.debug(f"Name from MRZ: {obj['name']}")
         except Exception:
             pass
 
